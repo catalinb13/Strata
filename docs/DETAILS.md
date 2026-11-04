@@ -1014,6 +1014,11 @@ print(r.choices[0].message.content)
   `max_tokens` (the rest of the context) get a budget of three quarters of it. `"answer_room": false` in
   `strata-<model>.json` turns it off. Qwen recommends up to 262,144 tokens of reasoning and 131,072 of answer: a client
   should not cap the reply far below what the context allows.
+  A short cap of 48 to 1,023 tokens keeps the same room on DeepSeek-V4.1 without any key
+  (the thinking is capped at half of it, the wrap-up and the answer take the other half);
+  other families opt in with `"short_answer_room": true` (off by default, #5189).
+  `answer_room: false` turns this off too, a request's own positive thinking budget takes
+  precedence, and an answer is not guaranteed to fit or be correct.
 - **A reply that ends inside its thinking (#1053, opt-in).** Some turns write a sentence of reasoning and then the
   end-of-turn token with no `</think>`: the content is empty and an agent stops. `"reasoning_close_retry": true` in
   `strata-<model>.json` closes the thinking once (as the thinking budget does) and continues, once per request, only for
