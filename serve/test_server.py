@@ -4448,12 +4448,14 @@ class ThinkingBudget(unittest.TestCase):
         self.assertEqual(len(self.engine.prompts), 2)              # the wrap-up continuation
 
     def test_the_answer_room_has_its_limits(self):
+        self.svc.short_answer_room = True                           # the #5189 opt-in
         self.engine.THOUGHT = "Let me think step by step about two plus two. " * 40
         code, b = self.post("/v1/chat/completions", {"model": "m", "max_tokens": 300,        # below the floor: 200
                                                      "messages": [{"role": "user", "content": "2+2?"}]})
         # 2026-10-21: small caps used to be "left as they were": the thinking ate the whole cap and the reply came
         # back (length) with no text and no tool call (the omp sub-agent harness sends 400 and gave up after 3).
-        # The answer now keeps its share (the #984 reserve): 300 leaves thinking 150 + answer room.
+        # #5189 landed the protection as opt-in ("short_answer_room": true): with it 300 leaves thinking 150 +
+        # answer room; without it a short cap is still eaten on a family that has no native reserve.
         self.assertEqual(b["choices"][0]["message"]["content"], ThinkingEngine.ANSWER)
         self.assertEqual(b["choices"][0]["finish_reason"], "stop")
         self.svc.answer_room = False                               # the config's "answer_room": false
