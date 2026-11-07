@@ -3290,7 +3290,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     last_batch_ = false;
     if (T < 1 || T > max_t_) { err = "verify: window size out of range"; return false; }
     // a layer split's hand-off buffers hold kVerifyMaxT rows
-    if (T > kVerifyMaxT && (next_ != nullptr || lb_ > 0)) { err = "verify: windows past 8 tokens need one stage"; return false; }
+    if (T > kVerifyMaxT && (next_ != nullptr || lb_ > 0)) { err = "verify: windows past " + std::to_string(kVerifyMaxT) + " tokens need one stage"; return false; }
     if (released_.load()) { err = "verify: an earlier window never finished on the GPU (#267); restart the engine"; return false; }
     const ModelGeometry& g = *g_;
     SessionState& ss = *ss_;

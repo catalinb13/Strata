@@ -12,6 +12,10 @@
 #   ninja -C build-metal
 cmake_minimum_required(VERSION 3.24)
 project(strata_metal LANGUAGES C CXX OBJCXX)
+# the verify / batch window's rows (the same knob as the HIP build's STRATA_WINDOW_MAX_T): the Mac engine runs deep
+# draft rounds (up to 15 drafts + the anchor token) as ONE grouped window instead of two or three narrow ones.
+set(STRATA_WINDOW_MAX_T 16 CACHE STRING "rows one verify / batch window holds (8, 12 or 16)")
+add_compile_definitions(STRATA_VERIFY_MAX_T=${STRATA_WINDOW_MAX_T})
 
 if(NOT APPLE)
   message(FATAL_ERROR "metal/ builds on macOS only")

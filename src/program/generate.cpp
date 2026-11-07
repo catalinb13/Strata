@@ -4393,7 +4393,7 @@ int main(int argc, char** argv) {
         ld.layer_split = !o.layer_split.empty(), ld.batch = o.batch > 1, ld.dflash2 = o.draft == "dflash2";
         ld.lookup_chain = o.lookup_chain > 0, ld.suffix_draft = o.suffix_draft > 0, ld.spec_at_least_2 = o.spec >= 2;
 #if defined(STRATA_GPU_METAL)
-        ld.metal_build = true;   // (Metal's windows hold 8 rows and it has no 12-row window: "metal window: window size out of range")
+        ld.metal_build = true;   // (Metal's windows hold 8 rows, 16 with STRATA_WINDOW_MAX_T=16, never 12: "metal window: window size out of range")
 #endif
         o.lookup_max_t = strata::core::default_lookup_max_t(ld);
     }

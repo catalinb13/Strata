@@ -1,6 +1,7 @@
 // The default of --lookup-max-t (the owner's #4040 decision): 12 where the pr-nv2 runs measured it, 0 everywhere else.
-// Header-only so a test can pin every condition.  Metal holds 8 rows in its windows (metal/src/engine/window.cpp MAXT) and has
-// no 12-row verify window: "metal window: window size out of range" ended the first Qwen serve request there, so a Metal
+// Header-only so a test can pin every condition.  Metal holds 8 rows in its windows (metal/src/engine/window.cpp MAXT,
+// 16 rows in a build configured with STRATA_WINDOW_MAX_T=16) and it has no 12-row verify window: "metal window:
+// window size out of range" ended the first Qwen serve request there, so a Metal
 // build keeps the option off.  (SYCL's generate.cpp has no such default at all.)
 #pragma once
 

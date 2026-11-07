@@ -12,7 +12,7 @@
 #include <vector>
 
 namespace {
-constexpr int P_NG = 0, P_MAXE = 128, P_GEXP = 16, P_GSTART = P_GEXP + P_MAXE, P_ETOK = P_GSTART + P_MAXE + 4,
+constexpr int P_NG = 0, P_MAXE = 256, P_GEXP = 16, P_GSTART = P_GEXP + P_MAXE, P_ETOK = P_GSTART + P_MAXE + 4,
               P_EW = P_ETOK + P_MAXE, P_TOKENT = P_EW + P_MAXE, P_INTS = P_TOKENT + P_MAXE;
 struct MoeArgs {
     uint64_t gate_off, up_off, down_off, gu_stride, d_stride;
@@ -24,12 +24,12 @@ int main() {
     mtl::Context cx;
     const int lib = cx.compile({"quant.metal", "units.metal", "moe.metal"});
     mtl::Pipeline p = cx.pipeline(lib, "moe_route");
-    mtl::Buffer lg = cx.alloc(4 * 8 * 512), ids = cx.alloc(4 * 80), w = cx.alloc(4 * 80), plan = cx.alloc(4 * P_INTS);
+    mtl::Buffer lg = cx.alloc(4 * 16 * 512), ids = cx.alloc(4 * 160), w = cx.alloc(4 * 160), plan = cx.alloc(4 * P_INTS);
     ref::Rng r(9);
     int fails = 0;
     double worst_w = 0;
     for (int trial = 0; trial < 200; ++trial) {
-        const int nt = 1 + trial % 8;
+        const int nt = 1 + trial % 16;
         for (int i = 0; i < nt * 512; ++i) {
             float v = r.sym() * 4.0f;
             if (trial % 3 == 0) v = std::round(v * 4.0f) / 4.0f;   // many exact ties
@@ -84,7 +84,7 @@ int main() {
         }
         fails += !ok;
     }
-    std::printf("route parity, 200 windows of 1..8 tokens (a third with exact ties): ids/plan mismatches %d, worst weight "
-                "rel err %.2e  %s\n", fails, worst_w, fails == 0 && worst_w < 2e-6 ? "PASS" : "FAIL");
+    std::printf("route parity, 200 windows of 1..16 tokens (a third with exact ties): ids/plan mismatches %d, worst "
+                "weight rel err %.2e  %s\n", fails, worst_w, fails == 0 && worst_w < 2e-6 ? "PASS" : "FAIL");
     return fails ? 1 : 0;
 }

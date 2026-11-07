@@ -16,7 +16,7 @@
 #include <vector>
 
 namespace {
-constexpr int S = 128, HK = 16, HV = 48, C = (2 * HK + HV) * S, MAXT = 8;
+constexpr int S = 128, HK = 16, HV = 48, C = (2 * HK + HV) * S, MAXT = 16;
 struct GdnArgs { uint32_t h_k, h_v, channels, commit; float eps; uint32_t plane; };
 double median(std::vector<double> v) { std::sort(v.begin(), v.end()); return v[v.size() / 2]; }
 struct Err {
@@ -68,7 +68,7 @@ int main(int argc, char** argv) {
         const char* kn = std::getenv("GDN_IB8") ? "gdn_step8" : "gdn_step";
         const int need = std::getenv("GDN_IB8") ? 1024 : 512;
         int low = 0;
-        for (int nt = 1; nt <= 8; ++nt) {
+        for (int nt = 1; nt <= 16; ++nt) {
             mtl::Pipeline pn = cx.pipeline(lib, kn, mtl::Constants().i(2, nt));
             std::printf("%s pipeline GDN_NTOK %d: max %d threads per threadgroup (the kernel needs %d)%s\n", kn, nt, pn.max_threads,
                         need, pn.max_threads < need ? "  TOO FEW" : "");
@@ -148,7 +148,7 @@ int main(int argc, char** argv) {
                     sums_ref ? "yes" : "NO", (rows_eq && sums_eq && sums_ref) ? "PASS" : "FAIL");
         fails += !(rows_eq && sums_eq && sums_ref);
     }
-    for (int nt = 1; nt <= 4; ++nt) {
+    for (int nt = 1; nt <= 16; ++nt) {
         mtl::Pipeline p = cx.pipeline(lib, std::getenv("GDN_IB8") ? "gdn_step8" : "gdn_step", mtl::Constants().i(2, nt));
         // determinism: the same verify call three times
         {

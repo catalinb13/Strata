@@ -25,6 +25,7 @@
 #include "strata/core/conversation_cache.hpp"
 #include "strata/core/session.hpp"
 #include "strata/kernels/ngram.hpp"
+#include "strata/kernels/window_limits.hpp"
 #include "strata/kernels/sampler.hpp"
 namespace strata::gpu { void* host_view(const void* device_pointer); }
 #include "strata/kernels/cpu/hadamard.hpp"
@@ -97,8 +98,9 @@ namespace {
 
 int g_slot_cap = 0;   // --batch N: the window keeps N + 1 sequences' running states side by side (set_batch_slots)
 
-constexpr int N = 2560, HC = 4, LR = 320, NFF = 640, TOPK = 10, NEXP = 512, MAXT = 8, NVOCAB_MAX = 248320;
-constexpr int P_MAXE = 128, P_GEXP = 16, P_GSTART = P_GEXP + P_MAXE, P_ETOK = P_GSTART + P_MAXE + 4,
+constexpr int N = 2560, HC = 4, LR = 320, NFF = 640, TOPK = 10, NEXP = 512, NVOCAB_MAX = 248320;
+constexpr int MAXT = strata::kernels::kWindowMaxT;   // the build's window rows (STRATA_WINDOW_MAX_T; the fixed 8 before the grouped verify)
+constexpr int P_MAXE = 256, P_GEXP = 16, P_GSTART = P_GEXP + P_MAXE, P_ETOK = P_GSTART + P_MAXE + 4,
               P_EW = P_ETOK + P_MAXE, P_TOKENT = P_EW + P_MAXE, P_INTS = P_TOKENT + P_MAXE, P_IGU = 4, P_IDN = 8;
 struct GemvArgs { uint32_t n_in, n_out, n_tok, row_bytes, x_stride, y_stride; };
 struct GrArgs { uint32_t n_embd, hc, hc_lr, n_tok, apply; float eps; };
@@ -210,7 +212,21 @@ GemvTile gemv_tile(int ty, int n_in, int n_out, int ntok, bool m12) {
     if (!m12 || env == "0" || gemv_nr_env() == 2) return g;
     const bool kq = ty == ref::Q4_K || ty == ref::Q5_K || ty == ref::Q6_K;
     const bool measured = kq || ty == ref::IQ4_XS || ty == ref::IQ3_S || ty == ref::Q8_0 || ty == ref::BF16;
-    if (!measured || ntok > 3 || n_out < 512 || g.L == 8) return g;
+    if (!measured || n_out < 512 || g.L == 8) return g;
+    if (ntok > 3) {
+        // wide windows (T 4..16, the --lookup-max-t verify path): measured here with gemv_parity --one --ntok 16 on
+        // an M1 Max.  At many tokens the window gemv is x-traffic bound, so fewer lanes per row and more rows per
+        // threadgroup win; the narrow (1..3 token) tiles below stay as they are.  Plain (not wide) decoders: the
+        // wide twins were only ever measured bitwise and timed for the narrow windows.
+        g.tuned = true;
+        if (g.K == 2) { g.L = 8; g.R = 2; g.S = 4; g.K = 1; }   // ssm_out, attn_output: 780 -> 411 us (6144 x 2560)
+        else if (n_in == 640) g.L = 4;                          // shexp down: 147 -> 85 us
+        else if (n_out >= 32768) g.L = 1;                       // LM head: 37.3 -> 14.7 ms (2560 x 248320)
+        else if (n_out >= 8192) g.L = 4;                        // gdn qkv: 792 -> 564 us (2560 x 10240)
+        else if (n_out >= 3072) g.L = 8;                        // gdn gate: 483 -> 348 us (2560 x 6144)
+        else if (n_out >= 1024) { g.L = 8; g.R = 2; }           // q / v and kin: 210 -> 182 us (2560 x 2560)
+        return g;   // 640-wide outputs (shexp up): the untuned 16,1 is fastest (71 us)
+    }
     g.tuned = true;
     g.wide = gemv_wide_type(ty);
     if (g.K == 2) {   // ssm_out, attn_output
@@ -2240,10 +2256,12 @@ bool Window::run(int Tn, const int32_t* tokens, int64_t pos0, bool head, int32_t
         const double r0 = now_ms();
         last_gpu_ms_ = 1000.0 * run_ds(c);
         {
-            // STRATA_METAL_KPROF=1: the GPU time report for each window class (T, head) once that class has run 20 times
+            // STRATA_METAL_KPROF=1: the GPU time report for each window class (T, head) once that class has run
+            // STRATA_METAL_KPROF_N times (default 20; a bench that forces widths lowers it to reach the deep classes).
             static const bool k_on = std::getenv("STRATA_METAL_KPROF") != nullptr;
+            static const int k_at = std::getenv("STRATA_METAL_KPROF_N") ? std::atoi(std::getenv("STRATA_METAL_KPROF_N")) : 20;
             static std::map<std::pair<int, bool>, int> seen;
-            if (k_on && ++seen[{Tn, head}] == 20) kprof(c.ds, Tn);   // stream too: the serial replay reads the last window's smap codes (valid slots); timing only, the run's answers go wrong after it
+            if (k_on && ++seen[{Tn, head}] == k_at) kprof(c.ds, Tn);   // stream too: the serial replay reads the last window's smap codes (valid slots); timing only, the run's answers go wrong after it
             static const int st = std::getenv("STRATA_METAL_STEPPROF") ? std::atoi(std::getenv("STRATA_METAL_STEPPROF")) : 0;
             static int seen2 = 0;
             static const int st_at = std::getenv("STRATA_METAL_STEPPROF_AT") ? std::atoi(std::getenv("STRATA_METAL_STEPPROF_AT")) : 20;

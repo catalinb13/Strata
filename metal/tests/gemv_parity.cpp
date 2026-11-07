@@ -122,7 +122,7 @@ int main(int argc, char** argv) {
     const int lib = cx.compile({"quant.metal", "units.metal", "gemv.metal", "gemv_wide.metal"},
                                std::getenv("GEMV_F16") ? "#define STRATA_METAL_F16 1\n" : "");
     std::printf("device %s\n", cx.device_name().c_str());
-    const int MAXT = 8;
+    const int MAXT = 16;
     mtl::Pipeline pprep = cx.pipeline(lib, "xprep");
 
     if (sweep) {
@@ -309,7 +309,7 @@ int main(int argc, char** argv) {
                 const size_t plane = (size_t)4 * n_in * MAXT;
                 std::vector<float> wf((size_t)n_in * n_out);
                 ref::dequant(t, W.ptr, wf.data(), wf.size());
-                for (int nt : {1, 3, 8}) {
+                for (int nt : {1, 3, 8, 16}) {
                     double worst = 0;
                     int not_exact = 0;
                     std::string worst_cfg;
@@ -379,7 +379,7 @@ int main(int argc, char** argv) {
                 for (int i = 0; i < n_in * MAXT; ++i) x.as<float>()[i] = r.sym();
                 cx.run({xprep_dispatch(pprep, x, xp, n_in, MAXT)});
                 const size_t plane = (size_t)4 * n_in * MAXT;
-                for (int nt : {1, 3, 8}) {
+                for (int nt : {1, 3, 8, 16}) {
                     GemvArgs a{(uint32_t)n_in, (uint32_t)n_out, (uint32_t)nt, (uint32_t)rb, (uint32_t)n_in, (uint32_t)n_out};
                     const uint32_t tgm = (uint32_t)(4 * nt * (n_in + n_in / 16) + 15) / 16 * 16;
                     auto run = [&](const std::string& kn, Cfg c, bool gx, std::vector<float>& out) {

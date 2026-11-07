@@ -40,7 +40,7 @@ namespace {
 
 constexpr int N_EMBD = 2560, N_FF = 640, TOPK = 10;
 // plan layout (moe.metal)
-constexpr int P_NG = 0, P_IGU = 4, P_IDN = 8, P_MAXE = 128, P_GEXP = 16, P_GSTART = P_GEXP + P_MAXE,
+constexpr int P_NG = 0, P_IGU = 4, P_IDN = 8, P_MAXE = 256, P_GEXP = 16, P_GSTART = P_GEXP + P_MAXE,
               P_ETOK = P_GSTART + P_MAXE + 4, P_EW = P_ETOK + P_MAXE, P_TOKENT = P_EW + P_MAXE,
               P_INTS = P_TOKENT + P_MAXE;
 

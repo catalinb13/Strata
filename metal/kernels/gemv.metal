@@ -15,7 +15,7 @@ struct GemvArgs {
     uint y_stride;   // floats between tokens' y rows
 };
 
-constant int NTOK [[function_constant(0)]];   // tokens of the window (1..8): the token loops are specialised
+constant int NTOK [[function_constant(0)]];   // tokens of the window (1..16): the token loops are specialised
 // a bench probe (function constant 9): 1 = tokens past the first reuse token 0's x (no load; wrong values),
 // 2 = tokens past the first skip the combine (wrong values)
 constant int GEMV_PROBE [[function_constant(9)]];
@@ -28,7 +28,7 @@ kernel void gemv(device const uchar* W [[buffer(0)]], device const float* xp [[b
                  ushort lane [[thread_index_in_simdgroup]], ushort tid [[thread_index_in_threadgroup]]) {
     constexpr int UNIT = fmt<F>::UNIT, RS = SG / KS, RG = 32 / LPR;
     threadgroup uint tab[fmt<F>::TAB];
-    threadgroup float red[KS > 1 ? KS * RS * RG * NR * 8 : 1];
+    threadgroup float red[KS > 1 ? KS * RS * RG * NR * 16 : 1];
     load_tab<F>(tab, tid, SG * 32);
     threadgroup_barrier(mem_flags::mem_threadgroup);
     const int ks = sg / RS, rs = sg % RS;
@@ -37,7 +37,7 @@ kernel void gemv(device const uchar* W [[buffer(0)]], device const float* xp [[b
     const int row0 = int(tg.x) * RS * RG * NR + lrow0;
     const int U = int(a.n_in) / UNIT;
     const int u0 = ks * U / KS, u1 = (ks + 1) * U / KS;
-    float acc[NR][8];
+    float acc[NR][16];
     for (int r = 0; r < NR; ++r)
         for (int t = 0; t < NTOK; ++t) acc[r][t] = 0.0f;
     device const uchar* rp[NR];
@@ -75,7 +75,7 @@ kernel void gemv(device const uchar* W [[buffer(0)]], device const float* xp [[b
             if (KS == 1) {
                 if (li == 0 && row0 + r < int(a.n_out)) y[t * int(a.y_stride) + row0 + r] = v;
             } else if (li == 0) {
-                red[(ks * RPT + lrow0 + r) * 8 + t] = v;
+                red[(ks * RPT + lrow0 + r) * 16 + t] = v;
             }
         }
     if (KS > 1) {
@@ -84,7 +84,7 @@ kernel void gemv(device const uchar* W [[buffer(0)]], device const float* xp [[b
             for (int r = 0; r < NR; ++r)
                 for (int t = 0; t < NTOK; ++t) {
                     float v = 0.0f;
-                    for (int k = 0; k < KS; ++k) v += red[(k * RPT + lrow0 + r) * 8 + t];
+                    for (int k = 0; k < KS; ++k) v += red[(k * RPT + lrow0 + r) * 16 + t];
                     if (row0 + r < int(a.n_out)) y[t * int(a.y_stride) + row0 + r] = v;
                 }
     }
@@ -168,7 +168,7 @@ kernel void gemv16(device const uchar* W [[buffer(0)]], device const half* xp [[
                    ushort lane [[thread_index_in_simdgroup]], ushort tid [[thread_index_in_threadgroup]]) {
     constexpr int UNIT = fmt<F>::UNIT, RS = SG / KS, RG = 32 / LPR;
     threadgroup uint tab[fmt<F>::TAB];
-    threadgroup float red[KS > 1 ? KS * RS * RG * NR * 8 : 1];
+    threadgroup float red[KS > 1 ? KS * RS * RG * NR * 16 : 1];
     load_tab<F>(tab, tid, SG * 32);
     threadgroup_barrier(mem_flags::mem_threadgroup);
     const int ks = sg / RS, rs = sg % RS;
@@ -177,7 +177,7 @@ kernel void gemv16(device const uchar* W [[buffer(0)]], device const half* xp [[
     const int row0 = int(tg.x) * RS * RG * NR + lrow0;
     const int U = int(a.n_in) / UNIT;
     const int u0 = ks * U / KS, u1 = (ks + 1) * U / KS;
-    float acc[NR][8];
+    float acc[NR][16];
     for (int r = 0; r < NR; ++r)
         for (int t = 0; t < NTOK; ++t) acc[r][t] = 0.0f;
     device const uchar* rp[NR];
@@ -201,7 +201,7 @@ kernel void gemv16(device const uchar* W [[buffer(0)]], device const half* xp [[
             if (KS == 1) {
                 if (li == 0 && row0 + r < int(a.n_out)) y[t * int(a.y_stride) + row0 + r] = v;
             } else if (li == 0) {
-                red[(ks * RPT + lrow0 + r) * 8 + t] = v;
+                red[(ks * RPT + lrow0 + r) * 16 + t] = v;
             }
         }
     if (KS > 1) {
@@ -210,7 +210,7 @@ kernel void gemv16(device const uchar* W [[buffer(0)]], device const half* xp [[
             for (int r = 0; r < NR; ++r)
                 for (int t = 0; t < NTOK; ++t) {
                     float v = 0.0f;
-                    for (int k = 0; k < KS; ++k) v += red[(k * RPT + lrow0 + r) * 8 + t];
+                    for (int k = 0; k < KS; ++k) v += red[(k * RPT + lrow0 + r) * 16 + t];
                     if (row0 + r < int(a.n_out)) y[t * int(a.y_stride) + row0 + r] = v;
                 }
     }
@@ -239,7 +239,7 @@ kernel void gemv_cat(device const uchar* W [[buffer(0)]], device const float* xp
     const int li = lane % LPR;
     const int row0 = int(tg.x) * SG * RG * NR + (sg * RG + lane / LPR) * NR;
     const int U = int(a.n_in) / UNIT, sp = int(n_split);
-    float acc[NR][8];
+    float acc[NR][16];
     for (int r = 0; r < NR; ++r)
         for (int t = 0; t < NTOK; ++t) acc[r][t] = 0.0f;
     device const uchar* rp[NR];
@@ -299,7 +299,7 @@ kernel void gemv_x(device const uchar* W [[buffer(0)]], device const float* xp [
     const int li = lane % LPR;
     const int row0 = int(tg.x) * SG * RG * NR + (sg * RG + lane / LPR) * NR;
     const int U = n / UNIT;
-    float acc[NR][8];
+    float acc[NR][16];
     for (int r = 0; r < NR; ++r)
         for (int t = 0; t < NTOK; ++t) acc[r][t] = 0.0f;
     device const uchar* rp[NR];

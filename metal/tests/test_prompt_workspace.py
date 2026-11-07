@@ -45,7 +45,9 @@ def main():
     buffers = section(window, "struct PromptBufs {", "// The vision path")
     geometry = section(window, "constexpr int N =", "constexpr int P_MAXE")
     constants = section(chain, "constexpr int PC_QB", "struct PcDqArgs")
-    setup = section(chain, "bool Window::pc_setup(int C)", "// one chunk of nT rows")
+    # the pc_kprof/pc_host_rows definitions live between pc_setup and the chunk comment (0.2.12); they take
+    # PcHost/PcGemmArgs types the shim does not declare, and the test is about pc_setup's allocations only.
+    setup = section(chain, "bool Window::pc_setup(int C)", "void Window::pc_kprof")
 
     # Enumerate actual members, independently of the fix's ownership vector.
     declaration = re.search(r"mtl::Buffer\s+([^;]+);", buffers)
@@ -67,6 +69,8 @@ def main():
 #import <Metal/Metal.h>
 #include "mtl_rt.h"
 #include "gguf_lite.h"
+#include "ref_quant.h"
+#include "strata/kernels/window_limits.hpp"
 #include <mach/mach.h>
 #include <array>
 #include <chrono>
@@ -236,7 +240,7 @@ int main() {
         source.write_text(harness, encoding="utf-8")
         subprocess.run([
             args.cxx, "-std=c++20", "-O1", "-fobjc-arc",
-            "-I", str(root / "metal/src"), str(source), str(args.runtime.resolve()),
+            "-I", str(root / "metal/src"), "-I", str(root / "include"), str(source), str(args.runtime.resolve()),
             "-framework", "Metal", "-framework", "Foundation", "-o", str(binary),
         ], check=True)
         return subprocess.run([str(binary)]).returncode

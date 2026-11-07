@@ -14,7 +14,7 @@
 #define P_NG 0
 #define P_IGU 4
 #define P_IDN 8
-#define P_MAXE 128
+#define P_MAXE 256
 #define P_GEXP 16
 #define P_GSTART (P_GEXP + P_MAXE)
 #define P_ETOK (P_GSTART + P_MAXE + 4)
