@@ -14,6 +14,7 @@ CFG=${HUIHUI_CFG:-$ROOT/strata-ud-q4_k_xl-huihui.json}
 PORT=${HUIHUI_PORT:-8180}
 MODEL=$(python3 -c "import json;print(json.load(open('$CFG'))['model_name'])" 2>/dev/null || echo qwen3.8-flash-next-ud-q4_k_xl-huihui)
 RLOG=/tmp/bw/restart.log
+ELOG=$(python3 -c "import json;print(json.load(open('$CFG')).get('log',''))" 2>/dev/null)
 
 say() { echo "[serve_huihui $(date +%H:%M:%S)] $*"; }
 port_pid() { lsof -nP -iTCP:"$PORT" -sTCP:LISTEN -t 2>/dev/null | head -1; }
@@ -58,11 +59,19 @@ stop() {
 }
 
 wait_ready() {  # $1 = seconds
-    local deadline=$(( $(date +%s) + ${1:-600} ))
+    local deadline=$(( $(date +%s) + ${1:-600} )) miss=0
     while [ "$(date +%s)" -lt "$deadline" ]; do
         if curl -s --max-time 4 "http://127.0.0.1:$PORT/v1/models" 2>/dev/null | grep -q '"loaded"'; then
             say "models loaded"
             return 0
+        fi
+        miss=$(( miss + 1 ))
+        # an engine that died at start (a bad config, an allocation that failed) is never going to load:
+        # stop after 60s without one instead of waiting out the whole window
+        if [ "$miss" -ge 30 ] && [ -z "$(pgrep -x strata 2>/dev/null)" ] && [ -n "$(port_pid)" ]; then
+            say "ERROR: the engine died at start (no strata process); last lines of ${ELOG:-the engine log}:"
+            [ -n "$ELOG" ] && tail -4 "$ELOG" | sed 's/^/    /'
+            return 1
         fi
         sleep 2
     done
