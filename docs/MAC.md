@@ -177,6 +177,19 @@ The arena was 11.5-14.7 GB. Tokens per second, one token per step (no MTP), medi
 
 `--spec 2` is the best default on mixed text. An explicit `--spec N` in the config's `args` is kept.
 
+### M1 Max, 64 GB, keeping the hot experts in memory (engine 0.1.58-metal)
+
+The Qwen3.8-Flash-Next UD-Q4_K_XL pack (104 GB, the experts streamed through an arena). The server's decode, tokens per second, short conversations, two or three runs each:
+
+| | 64 experts kept in memory | 4,096 kept |
+|---|---|---|
+| Decode | 19.5-21 | **26.5-28.6** |
+
+- `--expert-cache N` keeps the N experts a turn is most likely to use in memory instead of reading them every token (about 3.7 MB each, off by default). This machine's size is 4,096 (about 15 GB) with the arena at 38 GB: the arena and the cache together must fit in the 64 GB with everything else. 8,192 measured the same or a little better in short runs (28-31.3) but the machine started spilling into swap during longer ones; 11,000 cannot start at all (its 40.9 GB allocation fails).
+- The answers did not change at any cache size: the same weight bytes, only read from memory instead of the SSD.
+- A verify window of 16 tokens runs as one grouped pass on the GPU in 253.6 ms, against about 460 ms as sixteen one-token windows (`--lookup-max-t 16`, opt-in; the drafter still asks for at most two tokens at a time, so this is not used on the default path).
+- The DFlash2 drafter works on the Mac (`--draft dflash2 --draft-model <pack> --spec 8 --mtp-draft-vocab data/draft_vocab.bin`) and measured 21.8-22.1 tok/s here with 61% of its drafts accepted: it does not beat the smaller MTP drafter on this pack.
+
 ### Gyro-S and Gyro-M (agentionai's trellis experts)
 
 From 0.2.2 the Mac engine runs [Gyro](GYRO.md): the routed experts are trellis-coded blocks (ggml types TQ2_T, TQK6, TQK7) in a
