@@ -4,8 +4,10 @@
 #   serve_huihui.sh status              who is serving, memory
 #   serve_huihui.sh stop                graceful TERM, then KILL; waits for the port to close
 #   serve_huihui.sh start               start exactly the config's server line; wait for loaded + one live answer
+#   serve_huihui.sh restart             stop, then start: ONE command, so a down server is never left between steps
+#   serve_huihui.sh setenv K=V [K=V..]  stop; edit the config's engine env (K= clears, K- removes); start.
+#                                       The edit happens while stopped, so server.py cannot overwrite it on exit.
 #   serve_huihui.sh run CMD...          stop; run CMD (any exit); ALWAYS start again; health-check
-#
 # Never runs two engines: it will not start while anything answers on the port.
 # Designed to survive the assistant losing its own model mid-run: the restart always follows the test.
 set -u
@@ -55,7 +57,7 @@ stop() {
     sleep 3
     for e in $(pgrep -x strata 2>/dev/null); do kill -KILL "$e" 2>/dev/null; done
     if [ -n "$(port_pid)" ]; then say "ERROR: port $PORT still held"; return 1; fi
-    say "down; free: $(vm_stat | awk '/free pages/{f=$3} /speculative/{s=$3} END{printf "%.1f GB", (f+s)*4096/1073741824}')"
+    say "down; free: $(vm_stat | awk '/page size of/{for(i=1;i<=NF;i++) if($i=="of") ps=$(i+1)} /Pages free/{f=$3} /Pages speculative/{s=$3} END{if(!ps) ps=4096; gsub(/\./,"",f); gsub(/\./,"",s); printf "%.1f GB", (f+s+0)*ps/1073741824}')"
 }
 
 wait_ready() {  # $1 = seconds
@@ -71,6 +73,12 @@ wait_ready() {  # $1 = seconds
         if [ "$miss" -ge 30 ] && [ -z "$(pgrep -x strata 2>/dev/null)" ] && [ -n "$(port_pid)" ]; then
             say "ERROR: the engine died at start (no strata process); last lines of ${ELOG:-the engine log}:"
             [ -n "$ELOG" ] && tail -4 "$ELOG" | sed 's/^/    /'
+            return 1
+        fi
+        # server.py itself died before the port ever opened (a bad config, an import error): never wait it out
+        if [ -n "${SPID:-}" ] && ! kill -0 "$SPID" 2>/dev/null && [ -z "$(port_pid)" ]; then
+            say "ERROR: server.py (pid $SPID) exited before the port opened; last lines of $RLOG:"
+            tail -6 "$RLOG" | sed 's/^/    /'
             return 1
         fi
         sleep 2
@@ -100,8 +108,10 @@ start() {
     say "starting: serve/server.py --engine strata --config $CFG --port $PORT"
     cd "$ROOT" || return 1
     nohup python3 serve/server.py --engine strata --config "$CFG" --port "$PORT" >> "$RLOG" 2>&1 &
+    SPID=$!
     wait_ready 600 || { tail -20 "$RLOG"; return 1; }
-    probe_answer 240 || { tail -20 "$RLOG"; return 1; }
+    # a start right after a boot can queue behind a big parked re-prefill (100k tokens is ~7 min): give the probe room
+    probe_answer 600 || { tail -20 "$RLOG"; return 1; }
     say "serving again"
 }
 
@@ -109,6 +119,32 @@ case "${1:-status}" in
     status) status ;;
     stop)   stop ;;
     start)  start ;;
+    restart)
+        stop || { say "stop failed; server left as is"; exit 2; }
+        start || { say "START FAILED - retry manually: $0 start"; exit 3; }
+        ;;
+    setenv)
+        shift
+        if [ $# -lt 1 ]; then echo "usage: serve_huihui.sh setenv K=V [K=V...]   (K= clears, K- removes)"; exit 64; fi
+        stop || { say "stop failed; config not touched, server left as is"; exit 2; }
+        python3 - "$CFG" "$@" <<'PY' || { say "config edit failed; nothing started"; exit 4; }
+import json, sys
+p, toks = sys.argv[1], sys.argv[2:]
+c = json.load(open(p))
+env = c.setdefault("env", {})
+for t in toks:
+    if t.endswith("-") and "=" not in t:
+        env.pop(t[:-1], None)
+    elif "=" in t:
+        k, v = t.split("=", 1)
+        env[k] = v
+    else:
+        sys.exit(f"bad token: {t} (want K=V or K-)")
+json.dump(c, open(p, "w"), indent=2)
+print("[serve_huihui] env: " + ", ".join(f"{k}={v}" for k, v in sorted(env.items())))
+PY
+        start || { say "START FAILED with the new env - retry manually: $0 start"; exit 3; }
+        ;;
     run)
         shift
         mkdir -p /tmp/bw
@@ -118,5 +154,5 @@ case "${1:-status}" in
         start || { say "RESTART FAILED - retry manually: $0 start"; exit 3; }
         say "done (test exit $tesc)"
         ;;
-    *) echo "usage: serve_huihui.sh {status|stop|start|run CMD...}"; exit 64 ;;
+    *) echo "usage: serve_huihui.sh {status|stop|start|restart|setenv K=V ...|run CMD...}"; exit 64 ;;
 esac
