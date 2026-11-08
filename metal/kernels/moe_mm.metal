@@ -502,6 +502,7 @@ kernel void mm_dn_mpp(device const half* HS [[buffer(0)]], device const half* ED
 MMEXP(T_Q2_0) MMEXP(T_IQ3_XXS) MMEXP(T_IQ2_XXS) MMEXP(T_IQ2_XS) MMEXP(T_IQ2_S) MMEXP(T_IQ3_S) MMEXP(T_IQ4_XS) MMEXP(T_Q8_0)
 MMEXP(T_IQ4_NL) MMEXP(T_Q5_1)
 MMEXP(T_Q4_K) MMEXP(T_Q5_K)   // the UD-Q4_K_XL packs' routed gate/up (Q4_K; Q5_K in layer 2) on the mpp path
+MMEXP(T_Q5_0)   // the UD-IQ4_XS pack's down experts (Q5_0 in 33 of 48 layers; a missing mm_expand_6 aborts the first prompt chunk there)
 MMGUM_(16, 128, 4) MMDNM_(16, 64, 2) MMDNM_(16, 128, 4)
 
 // ---- v3: the weights decoded straight into matmul2d's right-input cooperative tensor (single-simdgroup scope),
