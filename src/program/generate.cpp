@@ -16434,6 +16434,15 @@ int main(int argc, char** argv) {
                     const strata::core::OnDevice on(rd);
                     int cur = 0;
                     size_t fb = 0, tb = 0;
+#ifdef STRATA_GPU_METAL
+                    // #2409 guards the copy stream a first restore allocates on CUDA. Apple Metal has no such stream:
+                    // the restore writes into buffers that exist (the window's own KV cells), while the working-set
+                    // budget - the metric this reads - says 0 free with the expert arena wired (it is not headroom).
+                    // Refusing on it re-reads whole prompts on an integrated GPU that never runs out the way it does.
+                    restore_free.push_back((uint64_t) (strata::program::conv_cache::kRestoreFirstUseMib << 20));
+                    restore_ready.push_back(1);
+                    continue;
+#endif
                     if (cudaGetDevice(&cur) != cudaSuccess || cudaMemGetInfo(&fb, &tb) != cudaSuccess) {
                         (void) cudaGetLastError();
                         sampled = false;   // no sample: the restore goes ahead as it always did
