@@ -1,5 +1,5 @@
 #!/bin/bash
-# metal/tools/serve_huihui.sh - stop / run-tests / restart the 8180 Huihui server safely.
+# metal/tools/serve_huihui.sh - stop / run-tests / restart the 8180 Huihui (UD-IQ4_XS) server safely.
 #
 #   serve_huihui.sh status              who is serving, memory
 #   serve_huihui.sh stop                graceful TERM, then KILL; waits for the port to close
@@ -12,9 +12,9 @@
 # Designed to survive the assistant losing its own model mid-run: the restart always follows the test.
 set -u
 ROOT=/Users/pc/src/Strata-fork
-CFG=${HUIHUI_CFG:-$ROOT/strata-ud-q4_k_xl-huihui.json}
+CFG=${HUIHUI_CFG:-$ROOT/strata-ud-iq4_xs-huihui.json}
 PORT=${HUIHUI_PORT:-8180}
-MODEL=$(python3 -c "import json;print(json.load(open('$CFG'))['model_name'])" 2>/dev/null || echo qwen3.8-flash-next-ud-q4_k_xl-huihui)
+MODEL=$(python3 -c "import json;print(json.load(open('$CFG'))['model_name'])" 2>/dev/null || echo qwen3.8-flash-next-ud-iq4_xs-huihui)
 RLOG=/tmp/bw/restart.log
 ELOG=$(python3 -c "import json;print(json.load(open('$CFG')).get('log',''))" 2>/dev/null)
 
