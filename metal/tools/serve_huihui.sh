@@ -14,6 +14,8 @@ set -u
 ROOT=/Users/pc/src/Strata-fork
 CFG=${HUIHUI_CFG:-$ROOT/strata-ud-iq4_xs-huihui.json}
 PORT=${HUIHUI_PORT:-8180}
+PY=${HUIHUI_PY:-$ROOT/.venv/bin/python}   # the run scripts start serve/server.py with the venv's python; match them
+[ -x "$PY" ] || PY=python3
 MODEL=$(python3 -c "import json;print(json.load(open('$CFG'))['model_name'])" 2>/dev/null || echo qwen3.8-flash-next-ud-iq4_xs-huihui)
 RLOG=/tmp/bw/restart.log
 ELOG=$(python3 -c "import json;print(json.load(open('$CFG')).get('log',''))" 2>/dev/null)
@@ -87,19 +89,32 @@ wait_ready() {  # $1 = seconds
     return 1
 }
 
-probe_answer() {  # one real completion; content or reasoning counts as life
+probe_answer() {  # one real completion; content or reasoning counts as life, but a run of "!" (token 0) is corruption
     local deadline out
     deadline=$(( $(date +%s) + ${1:-120} ))
     while [ "$(date +%s)" -lt "$deadline" ]; do
         out=$(curl -s --max-time 90 "http://127.0.0.1:$PORT/v1/chat/completions" -H 'Content-Type: application/json' \
             -d "{\"model\":\"$MODEL\",\"messages\":[{\"role\":\"user\",\"content\":\"Reply with the single word: pong\"}],\"max_tokens\":64,\"temperature\":0}")
-        if echo "$out" | grep -qE '"content": ?"[^"]|"reasoning'; then
+        # The UD-IQ4_XS decode bug emits "!" (vocab id 0) forever; the old grep called that a live answer. A
+        # completion whose content+reasoning, minus "!" and whitespace, is empty is the corruption, not life.
+        if printf '%s' "$out" | "$PY" -c '
+import sys, json
+try:
+    m = json.load(sys.stdin)["choices"][0]["message"]
+except Exception:
+    sys.exit(1)
+text = (m.get("content") or "") + (m.get("reasoning_content") or "")
+sys.exit(0 if text.strip("! \t\r\n") else 1)
+' 2>/dev/null; then
             say "live answer ok"
             return 0
         fi
+        if printf '%s' "$out" | grep -q '"choices"'; then
+            say "PROBE: engine answered but emitted the !-corruption (argmax fell to token 0); not ready"
+        fi
         sleep 3
     done
-    say "PROBE TIMEOUT: no completion in window"
+    say "PROBE TIMEOUT: no clean completion in window"
     return 1
 }
 
@@ -107,7 +122,7 @@ start() {
     if [ -n "$(port_pid)" ]; then say "ERROR: something already answers on $PORT; refusing to start a second engine"; return 1; fi
     say "starting: serve/server.py --engine strata --config $CFG --port $PORT"
     cd "$ROOT" || return 1
-    nohup python3 serve/server.py --engine strata --config "$CFG" --port "$PORT" >> "$RLOG" 2>&1 &
+    nohup "$PY" serve/server.py --engine strata --config "$CFG" --port "$PORT" >> "$RLOG" 2>&1 &
     SPID=$!
     wait_ready 600 || { tail -20 "$RLOG"; return 1; }
     # a start right after a boot can queue behind a big parked re-prefill (100k tokens is ~7 min): give the probe room

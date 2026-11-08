@@ -19,7 +19,7 @@ import sys
 import time
 import urllib.request
 
-CFG = "/Users/pc/src/Strata-fork/strata-ud-q4_k_xl-huihui.json"
+CFG = "/Users/pc/src/Strata-fork/strata-ud-iq4_xs-huihui.json"   # 2026-11-08: 8180 serves the UD-IQ4_XS pack
 URL = "http://127.0.0.1:8180/v1/chat/completions"
 
 
