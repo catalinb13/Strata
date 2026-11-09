@@ -233,11 +233,13 @@ def run_arm(arm: str, outdir: str, port: int, results: list) -> None:
                                        "What is the capital of France? Answer in one short sentence."}])
         rec("P1 short", t, dt, u, "CORRUPT" if clean_len(t) < 3 else "ok")
 
-        t, dt, u = chat(port, model, [{"role": "user", "content": long_prompt("ZQX4471K7")}])
+        # max_tokens 240: with 48 the model's thinking is cut mid-sentence and the needle simply
+        # never fits in the completion (the 2026-11-09 run showed exactly that at 48)
+        t, dt, u = chat(port, model, [{"role": "user", "content": long_prompt("ZQX4471K7")}], max_tokens=240)
         rec("P2 cold 21K", t, dt, u, "CORRUPT" if clean_len(t) < 3 else
             ("ok" if "ZQX4471K7" in t else "NEEDLE-MISS"))
 
-        t, dt, u = chat(port, model, [{"role": "user", "content": long_prompt("TRN9026Q4")}])
+        t, dt, u = chat(port, model, [{"role": "user", "content": long_prompt("TRN9026Q4")}], max_tokens=240)
         rec("P3 cold 21K again", t, dt, u, "CORRUPT" if clean_len(t) < 3 else
             ("ok" if "TRN9026Q4" in t else "NEEDLE-MISS"))
 
