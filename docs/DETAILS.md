@@ -1034,7 +1034,18 @@ print(r.choices[0].message.content)
   of 0.1.39 and later remove the overflows found so far; this guard catches whatever cause is left. Every verify window
   of `--serve` (the decode windows, the `--pipeline-windows` decode windows of a layer split, the prompt's short
   tail, batch slots) checks its head logits on the GPU beside the greedy pick (one small kernel into mapped flags, read
-  after the sync the window already does). A flagged window emits none of its tokens, the engine prints one
+  after the sync the window already does). The Apple Metal port has no device kernel; after each head window it scans
+  the logits rows in unified memory from the host (`metal_scan_rows` in `src/core/verify.cpp`) and records the same
+  fact. 0.1.58 found the Metal serve loop had been returning before that record entirely, so a poisoned conversation
+  streamed the sampler's token-0 "no candidate" answer forever instead; the scan costs about 60 microseconds a decode
+  window on the M1 Max, 0.2% of the window.
+  Whether the prompt scans were the origin of a real poisoning was tested with `metal/tests/gdn_prompt_parity.cpp
+  --stress`: 42 chained 2048-token chunks (86,016 tokens) at the state amplitudes a corrupted 85K-token window
+  measured (max |state| 14.6, max |conv| 28.3) keep every scan width within a relative 2.3e-8 of the sequential step,
+  with no non-finite value up to 10,000 times that amplitude. What is left of the origin is therefore the model's own
+  data, and the guard's position line is the field probe: a natural fire prints where in the context the first
+  poisoned window sat, which pins the repro.
+  A flagged window emits none of its tokens, the engine prints one
   `non-finite logits (#879)` line with the position, ends the request with `DONE ... nonfinite` (a slot:
   `BDONE <slot> <n> nonfinite`), and the next request first drops the live session, every checkpoint, every parked
   conversation and every idle slot (a slot still running finishes its reply and is not kept after it) and reads its
