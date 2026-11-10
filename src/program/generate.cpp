@@ -2295,6 +2295,38 @@ ConvStateSizes conv_state_sizes(const strata::core::ModelGeometry& g, const stra
     return z;
 }
 
+/// #879 (STRATA_NAN_CKPT_RESUME=1): true when every running state a checkpoint saved is finite.  The state vectors
+/// are pure fp32 payloads (conversation_state_sizes: `gdn` is each layer's recurrent state and conv history, `ple`
+/// the PLE history, `tails` and `dead` the indexer's tail rows; `block_pos` is the only int, empty on Metal), so
+/// the stored exponent-all-ones test is the same fact #879 records about a live row, and no honest state reaches
+/// 2^127.  The positional cells are not in the checkpoint and need no scan: the poison appears at one position and
+/// only moves forward, so a checkpoint at or before it saved a finite state and owns only cells that predate the
+/// poison, while every checkpoint after it saved the poisoned state and is dropped.  Reading on from the newest
+/// kept one rewrites the cells above it, the poisoned ones included.
+bool checkpoint_state_finite(const ConvCheckpoint& c) {
+    auto finite = [](const std::vector<uint8_t>& b) {
+        const uint32_t* w = (const uint32_t*) b.data();
+        for (size_t i = 0, n = b.size() / 4; i < n; ++i)
+            if ((w[i] & 0x7F800000u) == 0x7F800000u) return false;   // a NaN or an Inf, either sign
+        return true;
+    };
+    if (!finite(c.gdn) || !finite(c.ple) || !finite(c.tails) || !finite(c.dead)) return false;
+    for (const ConvCheckpoint& part : c.stage_parts)
+        if (!checkpoint_state_finite(part)) return false;
+    return true;
+}
+
+/// STRATA_NAN_CKPT_RESUME=1 (#879 recovery): after a flush, keep the checkpoints whose saved running state is
+/// still finite and let the next request read on from the newest of them instead of from token 0.  Off unless set:
+/// the flush is the full drop-out it always was.
+bool nan_ckpt_resume_env() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_NAN_CKPT_RESUME");
+        return v && v[0] == '1';
+    }();
+    return on;
+}
+
 /// Copies the running state out (this session's carve only).  The caller has synchronized the device.
 bool checkpoint_save(ConvCheckpoint& c, const strata::core::SessionState& ss, const strata::core::ModelGeometry& g) {
     std::string error;
@@ -16255,8 +16287,16 @@ int main(int argc, char** argv) {
                 }
                 const size_t n_checks = checks.size();
                 live_ok = false;
-                checks.clear();
-                tail_ckpt_len = -1;
+                const int64_t old_tail = tail_ckpt_len;
+                size_t n_kept = 0;
+                if (nan_ckpt_resume_env()) {   // #879 recovery: drop only checkpoints whose saved state holds the poison
+                    ckpt_pool.erase_if(checks, [](const ConvCheckpoint& c) { return !checkpoint_state_finite(c); });
+                    n_kept = checks.size();
+                } else checks.clear();
+                tail_ckpt_len = n_kept > 0 && old_tail >= 0 &&
+                                std::any_of(checks.begin(), checks.end(), [old_tail](const ConvCheckpoint& c) {
+                                    return (int64_t) c.ids.size() == old_tail; })
+                            ? old_tail : -1;   // the flagged tail survives only with its checkpoint; the scan ran already
                 const size_t n_parked = conversations.clear();
                 size_t n_slots = 0, n_running = 0;
                 for (BSlot& sl : bs)
@@ -16278,9 +16318,15 @@ int main(int argc, char** argv) {
                     }
                 std::fprintf(stderr, "strata serve: after non-finite logits (#879): dropped the live session, %zu "
                                      "checkpoint%s, %zu parked conversation%s and %zu idle slot%s (%zu running slot%s "
-                                     "not kept after their reply); reading this prompt from token 0\n", n_checks,
+                                     "not kept after their reply); reading this prompt from %s\n", n_checks,
                              n_checks == 1 ? "" : "s", n_parked, n_parked == 1 ? "" : "s", n_slots,
-                             n_slots == 1 ? "" : "s", n_running, n_running == 1 ? "" : "s");
+                             n_slots == 1 ? "" : "s", n_running, n_running == 1 ? "" : "s",
+                             n_kept > 0 ? "the newest sound checkpoint if this prompt starts with it (STRATA_NAN_CKPT_RESUME)"
+                                        : "token 0");
+                if (nan_ckpt_resume_env() && n_kept > 0)
+                    std::fprintf(stderr, "strata serve: #879: %zu of %zu checkpoints kept, their saved running state "
+                                         "holds no non-finite value; %zu dropped %s poisoned\n",
+                                 n_kept, n_checks, n_checks - n_kept, n_checks - n_kept == 1 ? "one is" : "ones are");
             }
             int64_t resume = 0;
             bool from_live = false;
