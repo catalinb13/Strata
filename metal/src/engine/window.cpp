@@ -512,6 +512,10 @@ private:
     bool bigs_ok_ = false;
     std::vector<mtl::Buffer> gstBig_, hbBig_, kqBig_, vqBig_, kscBig_, vscBig_, tailBig_, deadBig_, pooledBig_;
     mtl::Buffer pleBig_, rinfo_;
+    // #879 magnitude instrument (STRATA_METAL_GDNMAX): per GDN layer, the chunk max of |v| and |alpha| fed to the
+    // scan; gdn_max (gdn_prompt.metal) accumulates it on the GPU, checkpoint_save reads and clears it.
+    mtl::Buffer gdnmax_;
+    bool gdnmax_on_ = false;
     size_t st_gst_ = 0, st_hist_ = 0, st_kq_ = 0, st_sc_ = 0, st_tail_ = 0, st_dead_ = 0, st_pooled_ = 0, st_ple_ = 0;   // bytes between sets
     // --vision: the slots' own M-RoPE tables side by side (set idx at idx * st_mrope_), so a batch row rotates by its own
     // slot's table (rinfo_ row word 3: its offset in ints); allocated with the slots, only when the table is set
@@ -936,6 +940,7 @@ bool Window::init(const strata::core::ModelGeometry& g, strata::core::SessionSta
     };
     if (bigs_ok_) { pleBig_ = A(st_ple_ * NSET); pleHist_ = view_of(pleBig_, 0, 4 * 9 * 10240); } else pleHist_ = A(4 * 9 * 10240);
     rinfo_ = A(4 * (8 + 4 * MAXT));
+    if (gdnmax_on_ = (std::getenv("STRATA_METAL_GDNMAX") != nullptr)) gdnmax_ = A(8 * 64);
     st_mrope_ = R256(12 * (size_t) (MAXC + 16));
     auto act = [&](int n) {
         Act a;
@@ -3105,7 +3110,7 @@ namespace {
 // reported the same first hit - element 0 of one GDN layer block, bits 7fc00000, a different random
 // block per read - so this names the whole shape, not just the first word: a single poisoned
 // element and a strided write poisoning the first element of many blocks are two shapes, and the field decides.
-void log_poisoned_state(const strata::core::ConversationCheckpoint& c) {
+void log_poisoned_state(const strata::core::ConversationCheckpoint& c, float* gmax, long nl) {
     auto count = [](const std::vector<uint8_t>& b) {
         long k = 0;
         const uint32_t* w = (const uint32_t*) b.data();
@@ -3137,8 +3142,21 @@ void log_poisoned_state(const strata::core::ConversationCheckpoint& c) {
         std::snprintf(shape, sizeof shape, "gdn %ld words: element 0 of %ld block(s), %ld..%ld (bits %08x)", hits, blocks, blk0, blkN, bits);
     else std::snprintf(shape, sizeof shape, "gdn %ld words, %ld block(s) %ld..%ld, first offset %ld, last offset %ld (bits %08x)",
                        hits, blocks, blk0, blkN, off0, offN, bits);
+    // the magnitudes that fed the scan since the last report: a value at inf, or just below it, names arithmetic
+    char mag[96];
+    mag[0] = 0;
+    if (gmax) {
+        float vm = 0.0f, am = 0.0f;
+        long vl = -1, al = -1;
+        for (long i = 0; i < nl; ++i) {
+            if (!(vm >= gmax[2 * i])) { vm = gmax[2 * i]; vl = i; }    // !(>=) also catches NaN
+            if (!(am >= gmax[2 * i + 1])) { am = gmax[2 * i + 1]; al = i; }
+        }
+        std::snprintf(mag, sizeof mag, ", gdnmax |v| %g (L%ld), |alpha| %g (L%ld)", vm, vl, am, al);
+        std::memset(gmax, 0, (size_t) nl * 8);
+    }
     std::fprintf(stderr, "strata metal: #879s non-finite running state saved at checkpoint %zu tokens: %s%s"
-                         "ple %ld, tails %ld, dead %ld\n", c.ids.size(), shape, hits ? ", " : "", pw, tw, dw);
+                         "ple %ld, tails %ld, dead %ld%s\n", c.ids.size(), shape, hits ? ", " : "", pw, tw, dw, mag);
 }
 }  // namespace
 
@@ -3162,7 +3180,7 @@ bool Window::checkpoint_save(strata::core::ConversationCheckpoint& c, const stra
             std::memcpy(c.dead.data() + j * dsz, rg.dead[j].ptr, dsz);
         }
         c.block_pos.clear();
-        log_poisoned_state(c);
+        log_poisoned_state(c, nullptr, 0);
         return true;
         }
     }
@@ -3190,7 +3208,7 @@ bool Window::checkpoint_save(strata::core::ConversationCheckpoint& c, const stra
         std::memcpy(c.dead.data() + j * dsz, dead_[j].ptr, dsz);
     }
     c.block_pos.assign(tail_.size() * sizeof(int32_t), 0);   // scratch on every backend: written before it is read
-    log_poisoned_state(c);
+    log_poisoned_state(c, gdnmax_on_ ? (float*) gdnmax_.ptr : nullptr, (long) gst_.size());
     return true;
 }
 
@@ -3204,6 +3222,7 @@ void Window::reset() {
         zero(ghist_[1][i], 4 * 10240 * 3);
     }
     zero(pleHist_, 4 * 9 * 10240);
+    if (gdnmax_on_) zero(gdnmax_, 8 * 64);
     for (size_t j = 0; j < tail_.size(); ++j) {
         zero(tail_[j], 4 * 4 * 128);
         zero(dead_[j], 4 * 128);
@@ -4173,6 +4192,9 @@ bool Window::prompt_chunk(const int32_t* tokens, int Tn, int64_t pos0, std::stri
                mtl::Arg::B(p.gkq), mtl::Arg::B(p.go), mtl::Arg::V(ga)}, g_gx, 1, 32 * g_ib);
             D(PP(p.lgdn, "gdn_post"), {mtl::Arg::B(p.go), mtl::Arg::B(p.z), mtl::Arg::B(W_, TN(b + "ssm_norm.weight").offset),
                                        mtl::Arg::B(p.ygh), mtl::Arg::B(p.yg), mtl::Arg::V(ga)}, 48, T, 128);
+            if (gdnmax_on_)   // #879 instrument: magnitudes fed to the scan (gdn_prompt.metal gdn_max), read at checkpoints
+                D(PP(p.lgdn, "gdn_max"), {mtl::Arg::B(p.gvc), mtl::Arg::B(p.al), mtl::Arg::B(gdnmax_, (size_t) gi * 8),
+                                          mtl::Arg::V(T * 6144), mtl::Arg::V(T * 48)}, 1, 1, 1024);
             gemm(p.ygh, p.Wout, p.bo, T, N, 6144);
             }
         } else {

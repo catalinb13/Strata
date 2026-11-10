@@ -787,3 +787,23 @@ kernel void gdn_cstate2(device float* state [[buffer(0)]], device const float* q
         for (int jt = 0; jt < 4; ++jt)
             simdgroup_store(st[rt][jt], state + ((32 * sg + 8 * rt) * hv + h) * S + j0 + 8 * jt, hv * S);
 }
+
+// #879 magnitude instrument (host: STRATA_METAL_GDNMAX): the largest |value| of the scan's v and alpha inputs
+// of one GDN layer over the chunk's T rows, into out[0] and out[1].  One threadgroup; the host reads them
+// where it already synchronizes for a checkpoint.  max() ignores NaN (IEEE maxNum), so an inf shows up as inf
+// and a poisoned input still reports the magnitude of its finite companions.
+kernel void gdn_max(device const float* v [[buffer(0)]], device const float* al [[buffer(1)]],
+                    device float* out [[buffer(2)]], constant int& n_v [[buffer(3)]], constant int& n_a [[buffer(4)]],
+                    uint tid [[thread_position_in_threadgroup]], uint nt [[threads_per_threadgroup]]) {
+    threadgroup float redv[1024], reda[1024];
+    float mv = 0.0f, ma = 0.0f;
+    for (int i = int(tid); i < n_v; i += int(nt)) mv = max(mv, fabs(v[i]));
+    for (int i = int(tid); i < n_a; i += int(nt)) ma = max(ma, fabs(al[i]));
+    redv[tid] = mv; reda[tid] = ma;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = nt / 2; s > 0; s >>= 1) {
+        if (tid < s) { redv[tid] = max(redv[tid], redv[tid + s]); reda[tid] = max(reda[tid], reda[tid + s]); }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0) { out[0] = redv[0]; out[1] = reda[0]; }
+}
