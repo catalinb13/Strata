@@ -3101,24 +3101,44 @@ namespace {
 // fact #879 records, and these are the same arrays (a checkpoint's vectors are pure fp32 payload:
 // GDN state and conv history, PLE history, and the indexer's tail and dead rows; block_pos is
 // scratch and never scanned).  It reads only where a checkpoint already copied, on the host like
-// NFCHECK, and says nothing until it finds something.
+// NFCHECK, and says nothing until it finds something.  Every field incident 2026-11-10 (37 of them)
+// reported the same first hit - element 0 of one GDN layer block, bits 7fc00000, a different random
+// block per read - so this names the whole shape, not just the first word: a single poisoned
+// element and a strided write poisoning the first element of many blocks are two shapes, and the field decides.
 void log_poisoned_state(const strata::core::ConversationCheckpoint& c) {
-    struct Part { const char* name; const std::vector<uint8_t>* v; } parts[] = {
-        {"gdn (GDN state and conv history)", &c.gdn}, {"ple (PLE history)", &c.ple},
-        {"tails (indexer tail rows)", &c.tails}, {"dead (indexer dead rows)", &c.dead}};
-    const char* what = nullptr;
-    size_t word = 0;
-    uint32_t bits = 0;
-    for (const Part& p : parts) {
-        const uint32_t* w = (const uint32_t*) p.v->data();
-        const size_t n = p.v->size() / 4;
+    auto count = [](const std::vector<uint8_t>& b) {
+        long k = 0;
+        const uint32_t* w = (const uint32_t*) b.data();
+        const size_t n = b.size() / 4;
         for (size_t i = 0; i < n; ++i)
-            if ((w[i] & 0x7F800000u) == 0x7F800000u) { what = p.name; word = i; bits = w[i]; break; }
-        if (what) break;
-    }
-    if (what == nullptr) return;
-    std::fprintf(stderr, "strata metal: #879s non-finite running state saved at checkpoint %zu tokens: %s, "
-                         "word %zu (bits %08x)\n", c.ids.size(), what, word, bits);
+            if ((w[i] & 0x7F800000u) == 0x7F800000u) ++k;
+        return k;
+    };
+    const long L4 = (long) ((4 * 128 * 48 * 128 + 4 * 10240 * 3) / 4);   // words in one layer block
+    const uint32_t* w = (const uint32_t*) c.gdn.data();
+    const size_t n = c.gdn.size() / 4;
+    long hits = 0, blk0 = 0, blkN = 0, off0 = 0, offN = 0, blocks = 0;
+    uint32_t bits = 0;
+    long prev_blk = -1;
+    for (size_t i = 0; i < n; ++i)
+        if ((w[i] & 0x7F800000u) == 0x7F800000u) {
+            const long blk = (long) i / L4, off = (long) i % L4;
+            if (!hits) { blk0 = blk; off0 = off; bits = w[i]; }
+            if (blk != prev_blk) { ++blocks; prev_blk = blk; }
+            blkN = blk; offN = off;
+            ++hits;
+        }
+    const long pw = count(c.ple), tw = count(c.tails), dw = count(c.dead);
+    if (!hits && !pw && !tw && !dw) return;
+    char shape[192];
+    if (!hits) shape[0] = 0;
+    else if (hits == 1) std::snprintf(shape, sizeof shape, "gdn 1 word (block %ld offset %ld, bits %08x)", blk0, off0, bits);
+    else if (off0 == 0 && offN == 0 && hits == blocks)
+        std::snprintf(shape, sizeof shape, "gdn %ld words: element 0 of %ld block(s), %ld..%ld (bits %08x)", hits, blocks, blk0, blkN, bits);
+    else std::snprintf(shape, sizeof shape, "gdn %ld words, %ld block(s) %ld..%ld, first offset %ld, last offset %ld (bits %08x)",
+                       hits, blocks, blk0, blkN, off0, offN, bits);
+    std::fprintf(stderr, "strata metal: #879s non-finite running state saved at checkpoint %zu tokens: %s%s"
+                         "ple %ld, tails %ld, dead %ld\n", c.ids.size(), shape, hits ? ", " : "", pw, tw, dw);
 }
 }  // namespace
 
