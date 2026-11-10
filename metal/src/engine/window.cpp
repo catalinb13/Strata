@@ -3095,6 +3095,33 @@ void Window::bind_draft(strata::core::QsaState& st) {
     bind_qsa(st, mkq_[0], mvq_[0], mksc_[0], mvsc_[0], nullptr, nullptr, nullptr, max_cells_);
 }
 
+namespace {
+// #879 root-cause instrument: non-finite bytes in the state a checkpoint copies say the poison
+// already entered the compute before that token count.  The exponent-all-ones test is the exact
+// fact #879 records, and these are the same arrays (a checkpoint's vectors are pure fp32 payload:
+// GDN state and conv history, PLE history, and the indexer's tail and dead rows; block_pos is
+// scratch and never scanned).  It reads only where a checkpoint already copied, on the host like
+// NFCHECK, and says nothing until it finds something.
+void log_poisoned_state(const strata::core::ConversationCheckpoint& c) {
+    struct Part { const char* name; const std::vector<uint8_t>* v; } parts[] = {
+        {"gdn (GDN state and conv history)", &c.gdn}, {"ple (PLE history)", &c.ple},
+        {"tails (indexer tail rows)", &c.tails}, {"dead (indexer dead rows)", &c.dead}};
+    const char* what = nullptr;
+    size_t word = 0;
+    uint32_t bits = 0;
+    for (const Part& p : parts) {
+        const uint32_t* w = (const uint32_t*) p.v->data();
+        const size_t n = p.v->size() / 4;
+        for (size_t i = 0; i < n; ++i)
+            if ((w[i] & 0x7F800000u) == 0x7F800000u) { what = p.name; word = i; bits = w[i]; break; }
+        if (what) break;
+    }
+    if (what == nullptr) return;
+    std::fprintf(stderr, "strata metal: #879s non-finite running state saved at checkpoint %zu tokens: %s, "
+                         "word %zu (bits %08x)\n", c.ids.size(), what, word, bits);
+}
+}  // namespace
+
 bool Window::checkpoint_save(strata::core::ConversationCheckpoint& c, const strata::core::SessionState* ss, std::string& err) {
     const size_t gs = 4 * 128 * 48 * 128, hs = 4 * 10240 * 3, ts = 3 * 4 * 128, dsz = 4 * 128;
     // a batch slot's region: its rows commit inside the step, so the state is already whole there
@@ -3115,6 +3142,7 @@ bool Window::checkpoint_save(strata::core::ConversationCheckpoint& c, const stra
             std::memcpy(c.dead.data() + j * dsz, rg.dead[j].ptr, dsz);
         }
         c.block_pos.clear();
+        log_poisoned_state(c);
         return true;
         }
     }
@@ -3142,6 +3170,7 @@ bool Window::checkpoint_save(strata::core::ConversationCheckpoint& c, const stra
         std::memcpy(c.dead.data() + j * dsz, dead_[j].ptr, dsz);
     }
     c.block_pos.assign(tail_.size() * sizeof(int32_t), 0);   // scratch on every backend: written before it is read
+    log_poisoned_state(c);
     return true;
 }
 
