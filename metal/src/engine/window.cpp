@@ -940,7 +940,7 @@ bool Window::init(const strata::core::ModelGeometry& g, strata::core::SessionSta
     };
     if (bigs_ok_) { pleBig_ = A(st_ple_ * NSET); pleHist_ = view_of(pleBig_, 0, 4 * 9 * 10240); } else pleHist_ = A(4 * 9 * 10240);
     rinfo_ = A(4 * (8 + 4 * MAXT));
-    if (gdnmax_on_ = (std::getenv("STRATA_METAL_GDNMAX") != nullptr)) gdnmax_ = A(8 * 64);
+    if (gdnmax_on_ = (std::getenv("STRATA_METAL_GDNMAX") != nullptr)) gdnmax_ = A(16 * 64);
     st_mrope_ = R256(12 * (size_t) (MAXC + 16));
     auto act = [&](int n) {
         Act a;
@@ -3142,18 +3142,19 @@ void log_poisoned_state(const strata::core::ConversationCheckpoint& c, float* gm
         std::snprintf(shape, sizeof shape, "gdn %ld words: element 0 of %ld block(s), %ld..%ld (bits %08x)", hits, blocks, blk0, blkN, bits);
     else std::snprintf(shape, sizeof shape, "gdn %ld words, %ld block(s) %ld..%ld, first offset %ld, last offset %ld (bits %08x)",
                        hits, blocks, blk0, blkN, off0, offN, bits);
-    // the magnitudes that fed the scan since the last report: a value at inf, or just below it, names arithmetic
-    char mag[96];
+    // the magnitudes that fed the scan since the last report: a state ramp to inf names arithmetic, a small one names a race
+    char mag[128];
     mag[0] = 0;
     if (gmax) {
-        float vm = 0.0f, am = 0.0f;
-        long vl = -1, al = -1;
+        float vm = 0.0f, am = 0.0f, sm = 0.0f;
+        long vl = -1, al = -1, sl = -1;
         for (long i = 0; i < nl; ++i) {
-            if (!(vm >= gmax[2 * i])) { vm = gmax[2 * i]; vl = i; }    // !(>=) also catches NaN
-            if (!(am >= gmax[2 * i + 1])) { am = gmax[2 * i + 1]; al = i; }
+            if (!(vm >= gmax[3 * i])) { vm = gmax[3 * i]; vl = i; }    // !(>=) also catches NaN
+            if (!(am >= gmax[3 * i + 1])) { am = gmax[3 * i + 1]; al = i; }
+            if (!(sm >= gmax[3 * i + 2])) { sm = gmax[3 * i + 2]; sl = i; }
         }
-        std::snprintf(mag, sizeof mag, ", gdnmax |v| %g (L%ld), |alpha| %g (L%ld)", vm, vl, am, al);
-        std::memset(gmax, 0, (size_t) nl * 8);
+        std::snprintf(mag, sizeof mag, ", gdnmax |v| %g (L%ld), |alpha| %g (L%ld), |state| %g (L%ld)", vm, vl, am, al, sm, sl);
+        std::memset(gmax, 0, (size_t) nl * 12);
     }
     std::fprintf(stderr, "strata metal: #879s non-finite running state saved at checkpoint %zu tokens: %s%s"
                          "ple %ld, tails %ld, dead %ld%s\n", c.ids.size(), shape, hits ? ", " : "", pw, tw, dw, mag);
@@ -3222,7 +3223,7 @@ void Window::reset() {
         zero(ghist_[1][i], 4 * 10240 * 3);
     }
     zero(pleHist_, 4 * 9 * 10240);
-    if (gdnmax_on_) zero(gdnmax_, 8 * 64);
+    if (gdnmax_on_) zero(gdnmax_, 16 * 64);
     for (size_t j = 0; j < tail_.size(); ++j) {
         zero(tail_[j], 4 * 4 * 128);
         zero(dead_[j], 4 * 128);
@@ -4187,14 +4188,15 @@ bool Window::prompt_chunk(const int32_t* tokens, int Tn, int64_t pos0, std::stri
             int g_ib = 4, g_gx = 48 * 4;
             if (gs == "scanr_2") g_ib = 2; else if (gs == "scanr_8") g_ib = 8; else if (gs == "scan_v") g_ib = 8;
             else if (gs == "scan_2") { g_ib = 2; g_gx = 48 * 2; } else if (gs == "scan_4") { g_ib = 1; g_gx = 48; }
+            if (gdnmax_on_)   // #879 instrument: the scan's input magnitudes and its state as the chunk starts (gdn_max)
+                D(PP(p.lgdn, "gdn_max"), {mtl::Arg::B(p.gvc), mtl::Arg::B(p.al), mtl::Arg::B(gdnmax_, (size_t) gi * 16),
+                                          mtl::Arg::V(T * 6144), mtl::Arg::V(T * 48), mtl::Arg::B(gst_[(size_t) gi]),
+                                          mtl::Arg::V(4 * 128 * 48 * 128 / 4)}, 1, 1, 1024);
             D(PP(p.lgdn, gk, mtl::Constants().i(6, 0), gk),
               {mtl::Arg::B(gst_[(size_t) gi]), mtl::Arg::B(p.gqn), mtl::Arg::B(p.gkn), mtl::Arg::B(p.gvc), mtl::Arg::B(p.ggb),
                mtl::Arg::B(p.gkq), mtl::Arg::B(p.go), mtl::Arg::V(ga)}, g_gx, 1, 32 * g_ib);
             D(PP(p.lgdn, "gdn_post"), {mtl::Arg::B(p.go), mtl::Arg::B(p.z), mtl::Arg::B(W_, TN(b + "ssm_norm.weight").offset),
                                        mtl::Arg::B(p.ygh), mtl::Arg::B(p.yg), mtl::Arg::V(ga)}, 48, T, 128);
-            if (gdnmax_on_)   // #879 instrument: magnitudes fed to the scan (gdn_prompt.metal gdn_max), read at checkpoints
-                D(PP(p.lgdn, "gdn_max"), {mtl::Arg::B(p.gvc), mtl::Arg::B(p.al), mtl::Arg::B(gdnmax_, (size_t) gi * 8),
-                                          mtl::Arg::V(T * 6144), mtl::Arg::V(T * 48)}, 1, 1, 1024);
             gemm(p.ygh, p.Wout, p.bo, T, N, 6144);
             }
         } else {
