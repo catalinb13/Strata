@@ -798,25 +798,40 @@ kernel void gdn_cstate2(device float* state [[buffer(0)]], device const float* q
 // interval still shows its finite ramp (1e30-ish), and other small magnitudes say a race, not arithmetic.
 kernel void gdn_max(device const float* v [[buffer(0)]], device const float* al [[buffer(1)]],
                     device float* out [[buffer(2)]], constant int& n_v [[buffer(3)]], constant int& n_a [[buffer(4)]],
-                    device const float* st [[buffer(5)]], constant int& n_s [[buffer(6)]],
+                    device const float* st [[buffer(5)]], constant int& n_s [[buffer(6)]], constant int& wv [[buffer(7)]],
                     uint tid [[thread_position_in_threadgroup]], uint nt [[threads_per_threadgroup]]) {
     auto maxp = [](float a, float b) { return (a != a) ? a : ((b != b) ? b : max(a, b)); };   // NaN-propagating max
     threadgroup float redv[1024], reda[1024], reds[1024];
+    threadgroup int redvr[1024];
     float mv = 0.0f, ma = 0.0f, ms = 0.0f;
-    for (int i = int(tid); i < n_v; i += int(nt)) mv = maxp(mv, fabs(v[i]));
+    int vr = -1;   // index of the v extreme (the earliest on ties), so the host can name the token row
+    for (int i = int(tid); i < n_v; i += int(nt)) {
+        const float cv = fabs(v[i]);
+        if (mv == mv && (cv != cv || cv > mv)) { mv = cv; vr = i; }   // a NaN mv sticks, a NaN cv replaces a finite one
+    }
     for (int i = int(tid); i < n_a; i += int(nt)) ma = maxp(ma, fabs(al[i]));
     for (int i = int(tid); i < n_s; i += int(nt)) ms = maxp(ms, fabs(st[i]));
-    redv[tid] = mv; reda[tid] = ma; reds[tid] = ms;
+    redv[tid] = mv; reda[tid] = ma; reds[tid] = ms; redvr[tid] = vr;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint s = nt / 2; s > 0; s >>= 1) {
         if (tid < s) {
-            redv[tid] = maxp(redv[tid], redv[tid + s]);
+            const float ov = redv[tid + s];
+            if (redv[tid] == redv[tid] && (ov != ov || ov > redv[tid])) { redv[tid] = ov; redvr[tid] = redvr[tid + s]; }
             reda[tid] = maxp(reda[tid], reda[tid + s]);
             reds[tid] = maxp(reds[tid], reds[tid + s]);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    if (tid == 0)
-        for (int j = 0; j < 3; ++j)
-            out[j] = maxp(out[j], j == 0 ? redv[0] : (j == 1 ? reda[0] : reds[0]));
+    if (tid == 0) {
+        // the slot's pad float [3] carries the row of v's extreme (index / wv); it updates only when the
+        // slot's value updates, so the row stays the witness of the value the host finally prints
+        const float cur = out[0], nv = redv[0];
+        if (cur == cur && (nv != nv || nv > cur)) {
+            out[0] = nv;
+            out[3] = (float) (redvr[0] > 0 ? redvr[0] / max(1, wv) : 0);
+        }
+        out[0] = maxp(out[0], nv);
+        out[1] = maxp(out[1], reda[0]);
+        out[2] = maxp(out[2], reds[0]);
+    }
 }

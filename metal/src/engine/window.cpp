@@ -3165,14 +3165,19 @@ void log_poisoned_state(const strata::core::ConversationCheckpoint& c, float* gm
                 if (x != x) { if (nf < 0) nf = i; }
                 else if (!(mx >= x)) { mx = x; ml = i; }
             }
+            // the slot's pad float names the row the extreme sits on: a row past the real tokens is a
+            // stale row of the fixed-shape graph (previous chunk's data), one inside them is this token's
+            const long rs = nf >= 0 ? (long) f[j][4 * nf + 3] : (ml >= 0 ? (long) f[j][4 * ml + 3] : 0);
             if (ql[j] > 1)
-                std::snprintf(q[j], sizeof q[j], nf >= 0 ? "%s %g (L%ld) nan (first L%ld)" : "%s %g (L%ld)",
-                              qname[j], mx, ml, nf);
+                std::snprintf(q[j], sizeof q[j], nf >= 0 ? "%s %g (L%ld r%ld) nan (first L%ld r%ld)" : "%s %g (L%ld r%ld)",
+                              qname[j], mx, ml, rs, nf, rs);
             else
-                std::snprintf(q[j], sizeof q[j], nf >= 0 ? "%s %g nan" : "%s %g", qname[j], mx);
+                std::snprintf(q[j], sizeof q[j], nf >= 0 ? "%s %g nan r%ld" : "%s %g r%ld", qname[j], mx, rs);
         }
         std::snprintf(mag, sizeof mag, ", gdnmax %s, %s, %s, %s, %s, %s, %s", q[0], q[1], q[2], q[3], q[4], q[5], q[6]);
-        std::memset(gmax, 0, (size_t) nl * 16 + 48 * 16 + 3 * 16);
+        std::memset(gmax, 0, 16 * 128);   // the whole buffer: the gdn slots end at byte 576 but the hidden
+                                          // slots run to 1791 and the ple group to 1839 - a per-group sum
+                                          // (the old size) left layers >= 23 and every ple field un-cleared
     }
     std::fprintf(stderr, "strata metal: #879s non-finite running state saved at checkpoint %zu tokens: %s%s"
                          "ple %ld, tails %ld, dead %ld%s\n", c.ids.size(), shape, hits ? ", " : "", pw, tw, dw, mag);
@@ -4178,9 +4183,11 @@ bool Window::prompt_chunk(const int32_t* tokens, int Tn, int64_t pos0, std::stri
         if (gdnmax_on_) {   // #879 instrument: the embedding and its PLE projections - where the huge hidden starts
             const mtl::Arg b3[3] = {mtl::Arg::B(p.emb), mtl::Arg::B(p.pkey), mtl::Arg::B(p.pval)};
             const int nn3[3] = {(int) (T * N), (int) (T * 10240), (int) (T * N)};
+            const int wv3[3] = {(int) N, 10240, (int) N};   // row widths, so the pad float names the token row
             for (int j = 0; j < 3; ++j)
                 D(PP(p.lgdn, "gdn_max"), {b3[j], b3[j], mtl::Arg::B(gdnmax_, (size_t) 1792 + (size_t) j * 16),
-                                          mtl::Arg::V(nn3[j]), mtl::Arg::V(0), b3[j], mtl::Arg::V(nn3[j])}, 1, 1, 1024);
+                                          mtl::Arg::V(nn3[j]), mtl::Arg::V(0), b3[j], mtl::Arg::V(nn3[j]),
+                                          mtl::Arg::V(wv3[j])}, 1, 1, 1024);
         }
     }
     const int MB = (int) max_cells_ / 4 + 2;
@@ -4194,7 +4201,7 @@ bool Window::prompt_chunk(const int32_t* tokens, int Tn, int64_t pos0, std::stri
             D(PP(p.lgdn, "gdn_max"), {mtl::Arg::B(p.mixh), mtl::Arg::B(p.mixh),
                                       mtl::Arg::B(gdnmax_, (size_t) 1024 + (size_t) l * 16),
                                       mtl::Arg::V(T * 10240), mtl::Arg::V(0), mtl::Arg::B(p.mixh),
-                                      mtl::Arg::V(T * 10240)}, 1, 1, 1024);
+                                      mtl::Arg::V(T * 10240), mtl::Arg::V(10240)}, 1, 1, 1024);
         if (!sk("hc")) hc_read(b + "hc_attn", l > 0 && !(l == 1 && ple_on_));   // (the FFN read counts as moe below)
         if (l % 4 != 3) {
             if (!sk("gdn")) {
@@ -4224,7 +4231,7 @@ bool Window::prompt_chunk(const int32_t* tokens, int Tn, int64_t pos0, std::stri
             if (gdnmax_on_)   // #879 instrument: the scan's input magnitudes and its state as the chunk starts (gdn_max)
                 D(PP(p.lgdn, "gdn_max"), {mtl::Arg::B(p.gvc), mtl::Arg::B(p.al), mtl::Arg::B(gdnmax_, (size_t) gi * 16),
                                           mtl::Arg::V(T * 6144), mtl::Arg::V(T * 48), mtl::Arg::B(gst_[(size_t) gi]),
-                                          mtl::Arg::V(4 * 128 * 48 * 128 / 4)}, 1, 1, 1024);
+                                          mtl::Arg::V(4 * 128 * 48 * 128 / 4), mtl::Arg::V(6144)}, 1, 1, 1024);
             D(PP(p.lgdn, gk, mtl::Constants().i(6, 0), gk),
               {mtl::Arg::B(gst_[(size_t) gi]), mtl::Arg::B(p.gqn), mtl::Arg::B(p.gkn), mtl::Arg::B(p.gvc), mtl::Arg::B(p.ggb),
                mtl::Arg::B(p.gkq), mtl::Arg::B(p.go), mtl::Arg::V(ga)}, g_gx, 1, 32 * g_ib);
