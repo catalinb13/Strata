@@ -940,7 +940,7 @@ bool Window::init(const strata::core::ModelGeometry& g, strata::core::SessionSta
     };
     if (bigs_ok_) { pleBig_ = A(st_ple_ * NSET); pleHist_ = view_of(pleBig_, 0, 4 * 9 * 10240); } else pleHist_ = A(4 * 9 * 10240);
     rinfo_ = A(4 * (8 + 4 * MAXT));
-    if (gdnmax_on_ = (std::getenv("STRATA_METAL_GDNMAX") != nullptr)) gdnmax_ = A(16 * 64);
+    if (gdnmax_on_ = (std::getenv("STRATA_METAL_GDNMAX") != nullptr)) gdnmax_ = A(16 * 128);
     st_mrope_ = R256(12 * (size_t) (MAXC + 16));
     auto act = [&](int n) {
         Act a;
@@ -3143,28 +3143,33 @@ void log_poisoned_state(const strata::core::ConversationCheckpoint& c, float* gm
     else std::snprintf(shape, sizeof shape, "gdn %ld words, %ld block(s) %ld..%ld, first offset %ld, last offset %ld (bits %08x)",
                        hits, blocks, blk0, blkN, off0, offN, bits);
     // the magnitudes that fed the scan since the last report: a state ramp to inf names arithmetic, a small
-    // one names a race.  The kernel writes three floats at a 16-byte slot per layer (Arg::B offsets are
-    // bytes), so read stride 4 - with stride 3 the report reads the never-written fourth float as a late
-    // layer's state and prints "state 0".  A NaN slot poisons monotone tracking, so the first NaN layer
-    // (the earliest chunk start whose state buffer already held NaN) is named apart from the finite maximum.
-    char mag[256];
+    // one names a race.  The kernel writes three floats at a 16-byte slot (Arg::B offsets are bytes), so
+    // read stride 4 - with stride 3 the report reads the never-written fourth float as a late layer's state
+    // and prints "state 0".  A NaN slot poisons monotone tracking, so the first NaN layer (the earliest
+    // layer whose sampled buffer held NaN at any chunk start) is named apart from the finite maximum.  The
+    // fourth field samples p.mixh - the hidden stream at layer entry - at byte 1024 for all 48 model
+    // layers, so the report names the layer whose OUTPUT turned non-finite (the entry of layer L is the
+    // output of layer L-1); the scan fields use GDN indices, the hidden field the model layer index.
+    char mag[320];
     mag[0] = 0;
     if (gmax) {
-        static const char* qname[3] = {"|v|", "|alpha|", "|state|"};
-        char q[3][64];
-        for (int j = 0; j < 3; ++j) {
+        char q[4][64];
+        const float* f[4] = {gmax, gmax + 1, gmax + 2, gmax + 256};
+        const char* qname[4] = {"|v|", "|alpha|", "|state|", "|hid|"};
+        const long ql[4] = {nl, nl, nl, 48};
+        for (int j = 0; j < 4; ++j) {
             float mx = 0.0f;
             long ml = -1, nf = -1;
-            for (long i = 0; i < nl; ++i) {
-                const float x = gmax[4 * i + j];
+            for (long i = 0; i < ql[j]; ++i) {
+                const float x = f[j][4 * i];
                 if (x != x) { if (nf < 0) nf = i; }
                 else if (!(mx >= x)) { mx = x; ml = i; }
             }
             std::snprintf(q[j], sizeof q[j], nf >= 0 ? "%s %g (L%ld) nan (first L%ld)" : "%s %g (L%ld)",
                           qname[j], mx, ml, nf);
         }
-        std::snprintf(mag, sizeof mag, ", gdnmax %s, %s, %s", q[0], q[1], q[2]);
-        std::memset(gmax, 0, (size_t) nl * 16);
+        std::snprintf(mag, sizeof mag, ", gdnmax %s, %s, %s, %s", q[0], q[1], q[2], q[3]);
+        std::memset(gmax, 0, (size_t) nl * 16 + 48 * 16);
     }
     std::fprintf(stderr, "strata metal: #879s non-finite running state saved at checkpoint %zu tokens: %s%s"
                          "ple %ld, tails %ld, dead %ld%s\n", c.ids.size(), shape, hits ? ", " : "", pw, tw, dw, mag);
@@ -3233,7 +3238,7 @@ void Window::reset() {
         zero(ghist_[1][i], 4 * 10240 * 3);
     }
     zero(pleHist_, 4 * 9 * 10240);
-    if (gdnmax_on_) zero(gdnmax_, 16 * 64);
+    if (gdnmax_on_) zero(gdnmax_, 16 * 128);
     for (size_t j = 0; j < tail_.size(); ++j) {
         zero(tail_[j], 4 * 4 * 128);
         zero(dead_[j], 4 * 128);
@@ -4172,6 +4177,14 @@ bool Window::prompt_chunk(const int32_t* tokens, int Tn, int64_t pos0, std::stri
     (void) MB;
     for (int l = 0; l < 48; ++l) {
         const std::string b = "blk." + std::to_string(l) + ".";
+        // #879 instrument: the hidden stream at layer entry, in the slot region at byte 1024 (one 16-byte
+        // slot per model layer, the same gdn_max kernel into out[0]); l = 0 is skipped because mixh is the
+        // embedding output there and unwritten before the first mix.
+        if (gdnmax_on_ && l > 0)
+            D(PP(p.lgdn, "gdn_max"), {mtl::Arg::B(p.mixh), mtl::Arg::B(p.mixh),
+                                      mtl::Arg::B(gdnmax_, (size_t) 1024 + (size_t) l * 16),
+                                      mtl::Arg::V(T * 10240), mtl::Arg::V(0), mtl::Arg::B(p.mixh),
+                                      mtl::Arg::V(T * 10240)}, 1, 1, 1024);
         if (!sk("hc")) hc_read(b + "hc_attn", l > 0 && !(l == 1 && ple_on_));   // (the FFN read counts as moe below)
         if (l % 4 != 3) {
             if (!sk("gdn")) {
