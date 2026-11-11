@@ -789,28 +789,34 @@ kernel void gdn_cstate2(device float* state [[buffer(0)]], device const float* q
 }
 
 // #879 magnitude instrument (host: STRATA_METAL_GDNMAX): the largest |value| of the scan's v and alpha
-// inputs and of the layer's recurrent state as the chunk starts (dispatched before the scan overwrites
-// it), into out[0..2].  One threadgroup; the host reads them where it already synchronizes for a
-// checkpoint.  max() ignores NaN (IEEE maxNum): a poisoned array still reports the magnitude of its
-// finite companions, and the chunk before an inf shows the ramp that produced it.
+// inputs and of the layer's recurrent state at each chunk start (the scan writes the state back only at
+// the chunk's end), kept into out[0..2].  One threadgroup; the host reads them where it already
+// synchronizes for a checkpoint, and the slots keep the running max over the chunks since that read
+// (only the host's clear empties them).  max() alone ignores NaN (IEEE maxNum) and would hide the
+// poisoned layer behind its finite companions, so NaN is propagated explicitly: on the first poisoned
+// save, a layer that was already NaN at a chunk start reads NaN, while a layer that overflowed in this
+// interval still shows its finite ramp (1e30-ish), and other small magnitudes say a race, not arithmetic.
 kernel void gdn_max(device const float* v [[buffer(0)]], device const float* al [[buffer(1)]],
                     device float* out [[buffer(2)]], constant int& n_v [[buffer(3)]], constant int& n_a [[buffer(4)]],
                     device const float* st [[buffer(5)]], constant int& n_s [[buffer(6)]],
                     uint tid [[thread_position_in_threadgroup]], uint nt [[threads_per_threadgroup]]) {
+    auto maxp = [](float a, float b) { return (a != a) ? a : ((b != b) ? b : max(a, b)); };   // NaN-propagating max
     threadgroup float redv[1024], reda[1024], reds[1024];
     float mv = 0.0f, ma = 0.0f, ms = 0.0f;
-    for (int i = int(tid); i < n_v; i += int(nt)) mv = max(mv, fabs(v[i]));
-    for (int i = int(tid); i < n_a; i += int(nt)) ma = max(ma, fabs(al[i]));
-    for (int i = int(tid); i < n_s; i += int(nt)) ms = max(ms, fabs(st[i]));
+    for (int i = int(tid); i < n_v; i += int(nt)) mv = maxp(mv, fabs(v[i]));
+    for (int i = int(tid); i < n_a; i += int(nt)) ma = maxp(ma, fabs(al[i]));
+    for (int i = int(tid); i < n_s; i += int(nt)) ms = maxp(ms, fabs(st[i]));
     redv[tid] = mv; reda[tid] = ma; reds[tid] = ms;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint s = nt / 2; s > 0; s >>= 1) {
         if (tid < s) {
-            redv[tid] = max(redv[tid], redv[tid + s]);
-            reda[tid] = max(reda[tid], reda[tid + s]);
-            reds[tid] = max(reds[tid], reds[tid + s]);
+            redv[tid] = maxp(redv[tid], redv[tid + s]);
+            reda[tid] = maxp(reda[tid], reda[tid + s]);
+            reds[tid] = maxp(reds[tid], reds[tid + s]);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    if (tid == 0) { out[0] = redv[0]; out[1] = reda[0]; out[2] = reds[0]; }
+    if (tid == 0)
+        for (int j = 0; j < 3; ++j)
+            out[j] = maxp(out[j], j == 0 ? redv[0] : (j == 1 ? reda[0] : reds[0]));
 }
