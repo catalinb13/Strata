@@ -3150,14 +3150,14 @@ void log_poisoned_state(const strata::core::ConversationCheckpoint& c, float* gm
     // fourth field samples p.mixh - the hidden stream at layer entry - at byte 1024 for all 48 model
     // layers, so the report names the layer whose OUTPUT turned non-finite (the entry of layer L is the
     // output of layer L-1); the scan fields use GDN indices, the hidden field the model layer index.
-    char mag[320];
+    char mag[512];
     mag[0] = 0;
     if (gmax) {
-        char q[4][64];
-        const float* f[4] = {gmax, gmax + 1, gmax + 2, gmax + 256};
-        const char* qname[4] = {"|v|", "|alpha|", "|state|", "|hid|"};
-        const long ql[4] = {nl, nl, nl, 48};
-        for (int j = 0; j < 4; ++j) {
+        char q[7][64];
+        const float* f[7] = {gmax, gmax + 1, gmax + 2, gmax + 256, gmax + 448, gmax + 452, gmax + 456};
+        const char* qname[7] = {"|v|", "|alpha|", "|state|", "|hid|", "|emb|", "|pkey|", "|pval|"};
+        const long ql[7] = {nl, nl, nl, 48, 1, 1, 1};
+        for (int j = 0; j < 7; ++j) {
             float mx = 0.0f;
             long ml = -1, nf = -1;
             for (long i = 0; i < ql[j]; ++i) {
@@ -3165,11 +3165,14 @@ void log_poisoned_state(const strata::core::ConversationCheckpoint& c, float* gm
                 if (x != x) { if (nf < 0) nf = i; }
                 else if (!(mx >= x)) { mx = x; ml = i; }
             }
-            std::snprintf(q[j], sizeof q[j], nf >= 0 ? "%s %g (L%ld) nan (first L%ld)" : "%s %g (L%ld)",
-                          qname[j], mx, ml, nf);
+            if (ql[j] > 1)
+                std::snprintf(q[j], sizeof q[j], nf >= 0 ? "%s %g (L%ld) nan (first L%ld)" : "%s %g (L%ld)",
+                              qname[j], mx, ml, nf);
+            else
+                std::snprintf(q[j], sizeof q[j], nf >= 0 ? "%s %g nan" : "%s %g", qname[j], mx);
         }
-        std::snprintf(mag, sizeof mag, ", gdnmax %s, %s, %s, %s", q[0], q[1], q[2], q[3]);
-        std::memset(gmax, 0, (size_t) nl * 16 + 48 * 16);
+        std::snprintf(mag, sizeof mag, ", gdnmax %s, %s, %s, %s, %s, %s, %s", q[0], q[1], q[2], q[3], q[4], q[5], q[6]);
+        std::memset(gmax, 0, (size_t) nl * 16 + 48 * 16 + 3 * 16);
     }
     std::fprintf(stderr, "strata metal: #879s non-finite running state saved at checkpoint %zu tokens: %s%s"
                          "ple %ld, tails %ld, dead %ld%s\n", c.ids.size(), shape, hits ? ", " : "", pw, tw, dw, mag);
@@ -4172,6 +4175,13 @@ bool Window::prompt_chunk(const int32_t* tokens, int Tn, int64_t pos0, std::stri
         dq(TN("blk.1.ple_value.weight"), p.Wpv);
         gemm(p.embh, p.Wpk, p.pkey, T, 10240, N);
         gemm(p.embh, p.Wpv, p.pval, T, N, N);
+        if (gdnmax_on_) {   // #879 instrument: the embedding and its PLE projections - where the huge hidden starts
+            const mtl::Arg b3[3] = {mtl::Arg::B(p.emb), mtl::Arg::B(p.pkey), mtl::Arg::B(p.pval)};
+            const int nn3[3] = {(int) (T * N), (int) (T * 10240), (int) (T * N)};
+            for (int j = 0; j < 3; ++j)
+                D(PP(p.lgdn, "gdn_max"), {b3[j], b3[j], mtl::Arg::B(gdnmax_, (size_t) 1792 + (size_t) j * 16),
+                                          mtl::Arg::V(nn3[j]), mtl::Arg::V(0), b3[j], mtl::Arg::V(nn3[j])}, 1, 1, 1024);
+        }
     }
     const int MB = (int) max_cells_ / 4 + 2;
     (void) MB;
