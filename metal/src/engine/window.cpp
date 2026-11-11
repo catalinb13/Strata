@@ -3142,19 +3142,29 @@ void log_poisoned_state(const strata::core::ConversationCheckpoint& c, float* gm
         std::snprintf(shape, sizeof shape, "gdn %ld words: element 0 of %ld block(s), %ld..%ld (bits %08x)", hits, blocks, blk0, blkN, bits);
     else std::snprintf(shape, sizeof shape, "gdn %ld words, %ld block(s) %ld..%ld, first offset %ld, last offset %ld (bits %08x)",
                        hits, blocks, blk0, blkN, off0, offN, bits);
-    // the magnitudes that fed the scan since the last report: a state ramp to inf names arithmetic, a small one names a race
-    char mag[128];
+    // the magnitudes that fed the scan since the last report: a state ramp to inf names arithmetic, a small
+    // one names a race.  The kernel writes three floats at a 16-byte slot per layer (Arg::B offsets are
+    // bytes), so read stride 4 - with stride 3 the report reads the never-written fourth float as a late
+    // layer's state and prints "state 0".  A NaN slot poisons monotone tracking, so the first NaN layer
+    // (the earliest chunk start whose state buffer already held NaN) is named apart from the finite maximum.
+    char mag[256];
     mag[0] = 0;
     if (gmax) {
-        float vm = 0.0f, am = 0.0f, sm = 0.0f;
-        long vl = -1, al = -1, sl = -1;
-        for (long i = 0; i < nl; ++i) {
-            if (!(vm >= gmax[3 * i])) { vm = gmax[3 * i]; vl = i; }    // !(>=) also catches NaN
-            if (!(am >= gmax[3 * i + 1])) { am = gmax[3 * i + 1]; al = i; }
-            if (!(sm >= gmax[3 * i + 2])) { sm = gmax[3 * i + 2]; sl = i; }
+        static const char* qname[3] = {"|v|", "|alpha|", "|state|"};
+        char q[3][64];
+        for (int j = 0; j < 3; ++j) {
+            float mx = 0.0f;
+            long ml = -1, nf = -1;
+            for (long i = 0; i < nl; ++i) {
+                const float x = gmax[4 * i + j];
+                if (x != x) { if (nf < 0) nf = i; }
+                else if (!(mx >= x)) { mx = x; ml = i; }
+            }
+            std::snprintf(q[j], sizeof q[j], nf >= 0 ? "%s %g (L%ld) nan (first L%ld)" : "%s %g (L%ld)",
+                          qname[j], mx, ml, nf);
         }
-        std::snprintf(mag, sizeof mag, ", gdnmax |v| %g (L%ld), |alpha| %g (L%ld), |state| %g (L%ld)", vm, vl, am, al, sm, sl);
-        std::memset(gmax, 0, (size_t) nl * 12);
+        std::snprintf(mag, sizeof mag, ", gdnmax %s, %s, %s", q[0], q[1], q[2]);
+        std::memset(gmax, 0, (size_t) nl * 16);
     }
     std::fprintf(stderr, "strata metal: #879s non-finite running state saved at checkpoint %zu tokens: %s%s"
                          "ple %ld, tails %ld, dead %ld%s\n", c.ids.size(), shape, hits ? ", " : "", pw, tw, dw, mag);
