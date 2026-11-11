@@ -109,12 +109,28 @@ opt-out anchors at 29.97-30.49 vs 19.21-19.90, gap/results/1018-1545; `STRATA_ME
 0.8 ms/miss law held in every arm; `gap/gap.sh` pins `STRATA_METAL_ARENA_GB=33` so the dynamic file-cache floor
 (`sysctl vm.vm_page_filecache_min`) cannot move the arena between arms.
 
-The same box serving the Unsloth UD-Q4_K_XL pack (82.5 GB, the Huihui calibration) runs `--context 204800`, raised
-from 162,144 on 2026-10-26 with the same streaming settings (33 GB arena, 2048-token chunks, `mpp` + `scan_v`).
-Decode holds at depth: probes at 90-101K tokens decode 21.7-22.3 tok/s, live sessions 18-20; a 100,887-token cold
-prompt prefills at ~276 tok/s net, and a needle at the front of a 100K prompt is recalled exactly. Parking and
+The same box served the Unsloth UD-Q4_K_XL pack (82.5 GB, the Huihui calibration) at `--context 204800`, raised
+from 162,144 on 2026-10-26 with the streaming settings of the day (33 GB arena, 2048-token chunks, `mpp` + `scan_v`).
+Decode held at depth: probes at 90-101K tokens decode 21.7-22.3 tok/s, live sessions 18-20; a 100,887-token cold
+prompt prefilled at ~276 tok/s net, and a needle at the front of a 100K prompt is recalled exactly. Parking and
 sessions scale too: 108,665 tokens save to 1.78 GB and restore in 645 ms, and a continuation of a parked 100K
 conversation re-prefills 40 of 100,922 tokens.
+
+Since 2026-11-08 the box serves the Unsloth UD-IQ4_XS pack (60.4 GB in the Metal window, the Huihui abliteration),
+204,800-token context, `--expert-cache 4096` (4,781 slots, 10.94 GiB), a 38 GB arena (`STRATA_METAL_LEAVE_SHARE=0.55`),
+`mpp` + `scan_v`, `--spec 2 --suffix-draft 1`. A serve-level A/B on 2026-11-11 (10 arms, one probe: a 11,618-token
+cold prompt + greedy decode, a continued turn, an 18,068-token cold prompt + sampled decode; anchors bracket each
+group and agree within 1%, `/tmp/bw/ab-results.jsonl` of that day) bought three things. Turning the #879 debug
+instruments off (`STRATA_METAL_PROFILE`, `STRATA_METAL_GDNMAX`, `STRATA_METAL_LOGPOS` unset; the `#879` guard
+`STRATA_METAL_NFCHECK=1` and recovery `STRATA_NAN_CKPT_RESUME=1` stay) is free +11-12% on cold reads, 296-300 ->
+330-348 tok/s. `STRATA_METAL_PROMPT_CHUNK` 2048 -> 4096 stacks a further +8.5% (362-374 tok/s): the chunk's 5.79 GB
+of buffers borrow arena only while a prompt runs, and the first ~100 decode tokens after a cold prompt pay ~13%
+(41.9 ms/token) while the arena re-warms its top experts, back to 33.5 ms/token steady - a net win for long
+prompts; the 132-token greedy answer stayed byte-identical across the chunk sizes in the same run. `STRATA_ROUTE_TAIL_SKIP=0`
+costs nothing on this box (a 38 GB arena leaves almost no rank-7 misses to skip) and restores the exact expert set:
+the default 7 is measured +16.5% on a 12 GB card and changes the answers. `--expert-cache 6144`, a 34 GB arena and
+chunk 4096 without the instruments off all measured flat or worse. Steady decode is 27-30 tok/s at 12-18K depth and
+24.7 at 111K; the process holds ~50 GB of the 64 GB box (swap steady ~2 GB, macOS and a browser share the rest).
 
 Where the Q4_K decode time goes on this box (`STRATA_METAL_KPROF=1`, T=1 windows, 2026-10-26): 36 ms of GPU busy
 time out of the 47-55 ms wall a token takes - the rest is read-miss stalls and the per-cut handshakes. The routed
