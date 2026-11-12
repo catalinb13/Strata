@@ -1622,8 +1622,8 @@ to N tokens again (#2265).
 Measured on an M1 Max (64 GB, Metal window, 104,748-token prompt, 2026-11-12): parking a 104,637-token conversation
 takes **442.7 ms** and restoring it from its checkpoint **290.7 ms**, against 424-476 s to read that prompt again -
 about 600 times cheaper. That restore is why the second turn of a long conversation is 1.2 s instead of seven
-minutes (104,608 of 104,630 tokens reused). A turn costs 136-175 ms to park at 4.3-4.9K tokens (443 ms at 104K)
-with a ~300 MB snapshot, and that copy is usually superseded on the next turn. `park-gain` therefore stays at 0 by
+minutes (104,608 of 104,630 tokens reused). A turn costs about 115-175 ms to park at 4.3-4.9K tokens (443 ms at
+104K) with a ~300 MB snapshot, and that copy is usually superseded on the next turn. `park-gain` therefore stays at 0 by
 default: a copy N tokens stale re-reads those N at about 250 tok/s, so N=2048 would add 8.2 s to a restore to save
 0.44 s a turn. The gain only pays for a client whose conversation is parked and restored many times between turns.
 `--conversation-cache-min-free-mib N` (default 2560) additionally requires that
