@@ -3150,14 +3150,17 @@ void log_poisoned_state(const strata::core::ConversationCheckpoint& c, float* gm
     // fourth field samples p.mixh - the hidden stream at layer entry - at byte 1024 for all 48 model
     // layers, so the report names the layer whose OUTPUT turned non-finite (the entry of layer L is the
     // output of layer L-1); the scan fields use GDN indices, the hidden field the model layer index.
-    char mag[512];
+    char mag[640];
     mag[0] = 0;
     if (gmax) {
-        char q[7][64];
-        const float* f[7] = {gmax, gmax + 1, gmax + 2, gmax + 256, gmax + 448, gmax + 452, gmax + 456};
-        const char* qname[7] = {"|v|", "|alpha|", "|state|", "|hid|", "|emb|", "|pkey|", "|pval|"};
-        const long ql[7] = {nl, nl, nl, 48, 1, 1, 1};
-        for (int j = 0; j < 7; ++j) {
+        char q[12][64];
+        // the block-0 chain fields (go/ygh/yg/bo/qkv) sit in the free slot region at bytes 1088..1152
+        const float* f[12] = {gmax, gmax + 1, gmax + 2, gmax + 256, gmax + 448, gmax + 452, gmax + 456,
+                              gmax + 272, gmax + 276, gmax + 280, gmax + 284, gmax + 288};
+        const char* qname[12] = {"|v|", "|alpha|", "|state|", "|hid|", "|emb|", "|pkey|", "|pval|",
+                                 "|go|", "|ygh|", "|yg|", "|bo|", "|qkv|"};
+        const long ql[12] = {nl, nl, nl, 48, 1, 1, 1, 1, 1, 1, 1, 1};
+        for (int j = 0; j < 12; ++j) {
             float mx = 0.0f;
             long ml = -1, nf = -1;
             for (long i = 0; i < ql[j]; ++i) {
@@ -3174,7 +3177,8 @@ void log_poisoned_state(const strata::core::ConversationCheckpoint& c, float* gm
             else
                 std::snprintf(q[j], sizeof q[j], nf >= 0 ? "%s %g nan r%ld" : "%s %g r%ld", qname[j], mx, rs);
         }
-        std::snprintf(mag, sizeof mag, ", gdnmax %s, %s, %s, %s, %s, %s, %s", q[0], q[1], q[2], q[3], q[4], q[5], q[6]);
+        std::snprintf(mag, sizeof mag, ", gdnmax %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s",
+                      q[0], q[1], q[2], q[3], q[4], q[5], q[6], q[7], q[8], q[9], q[10], q[11]);
         std::memset(gmax, 0, 16 * 128);   // the whole buffer: the gdn slots end at byte 576 but the hidden
                                           // slots run to 1791 and the ple group to 1839 - a per-group sum
                                           // (the old size) left layers >= 23 and every ple field un-cleared
@@ -4238,6 +4242,19 @@ bool Window::prompt_chunk(const int32_t* tokens, int Tn, int64_t pos0, std::stri
             D(PP(p.lgdn, "gdn_post"), {mtl::Arg::B(p.go), mtl::Arg::B(p.z), mtl::Arg::B(W_, TN(b + "ssm_norm.weight").offset),
                                        mtl::Arg::B(p.ygh), mtl::Arg::B(p.yg), mtl::Arg::V(ga)}, 48, T, 128);
             gemm(p.ygh, p.Wout, p.bo, T, N, 6144);
+            if (gdnmax_on_ && gi == 0) {   // #879 instrument: block 0's chain - which stage lifts a healthy v to 1e5
+                // qkv (pre-projection input), go (scan output), ygh/yg (post-norm, gated), bo (out gemm); go is
+                // still valid here: gdn_post reads it and never writes it
+                const mtl::Arg bq[5] = {mtl::Arg::B(p.qkv), mtl::Arg::B(p.go), mtl::Arg::B(p.ygh),
+                                        mtl::Arg::B(p.yg), mtl::Arg::B(p.bo)};
+                const size_t oq[5] = {1088, 1104, 1120, 1136, 1152};   // slot bytes in the free region before emb (1792)
+                const int wq[5] = {10240, 6144, 6144, 6144, (int) N};
+                const int nq[5] = {(int) (T * 10240), (int) (T * 6144), (int) (T * 6144), (int) (T * 6144), (int) (T * N)};
+                for (int j = 0; j < 5; ++j)
+                    D(PP(p.lgdn, "gdn_max"), {bq[j], bq[j], mtl::Arg::B(gdnmax_, oq[j]),
+                                              mtl::Arg::V(nq[j]), mtl::Arg::V(0), bq[j], mtl::Arg::V(nq[j]),
+                                              mtl::Arg::V(wq[j])}, 1, 1, 1024);
+            }
             }
         } else {
             if (!sk("qsa")) {
