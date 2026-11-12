@@ -121,7 +121,8 @@ Since 2026-11-08 the box serves the Unsloth UD-IQ4_XS pack (60.4 GB in the Metal
 `mpp` + `scan_v`, `--spec 2 --suffix-draft 1`. A serve-level A/B on 2026-11-11 (10 arms, one probe: a 11,618-token
 cold prompt + greedy decode, a continued turn, an 18,068-token cold prompt + sampled decode; anchors bracket each
 group and agree within 1%, `/tmp/bw/ab-results.jsonl` of that day) bought three things. Turning the #879 debug
-instruments off (`STRATA_METAL_PROFILE`, `STRATA_METAL_GDNMAX`, `STRATA_METAL_LOGPOS` unset; the `#879` guard
+instruments off (`STRATA_METAL_PROFILE`, `STRATA_METAL_GDNMAX`, `STRATA_METAL_LOGPOS` unset, or `STRATA_METAL_GDNMAX=0`,
+which reads the same; the `#879` guard
 `STRATA_METAL_NFCHECK=1` and recovery `STRATA_NAN_CKPT_RESUME=1` stay) is free +11-12% on cold reads, 296-300 ->
 330-348 tok/s. `STRATA_METAL_PROMPT_CHUNK` 2048 -> 4096 stacks a further +8.5% (362-374 tok/s): the chunk's 5.79 GB
 of buffers borrow arena only while a prompt runs, and the first ~100 decode tokens after a cold prompt pay ~13%

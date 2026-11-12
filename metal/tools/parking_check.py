@@ -108,8 +108,10 @@ def conversation(mib, tag):
         if skip: skip = False; continue
         if x in drop: skip = True; continue
         keep.append(x)
-    if mib:
-        keep += ["--conversation-cache-mib", str(mib), "--conversation-cache-min-tokens", "2048"]
+    # The engine's --conversation-cache-mib now defaults to a RAM-sized budget when the flag is absent (#3493), so
+    # dropping the flag no longer means "off": an OFF arm that omits it still parks (measured parks=7, i.e. the two
+    # arms were identical).  An OFF arm must pass 0.
+    keep += ["--conversation-cache-mib", str(mib), "--conversation-cache-min-tokens", "2048"]
     cfg["args"], cfg["log"] = keep, f"/tmp/parking_engine_{tag}.log"
     cfg_path = f"/tmp/parking_cfg_{tag}.json"
     json.dump(cfg, open(cfg_path, "w"), indent=1)

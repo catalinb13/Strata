@@ -940,7 +940,11 @@ bool Window::init(const strata::core::ModelGeometry& g, strata::core::SessionSta
     };
     if (bigs_ok_) { pleBig_ = A(st_ple_ * NSET); pleHist_ = view_of(pleBig_, 0, 4 * 9 * 10240); } else pleHist_ = A(4 * 9 * 10240);
     rinfo_ = A(4 * (8 + 4 * MAXT));
-    if (gdnmax_on_ = (std::getenv("STRATA_METAL_GDNMAX") != nullptr)) gdnmax_ = A(16 * 128);
+    // The instrument is a per-chunk read of every layer's projections, so it is worth ~11-12% of the cold prefill
+    // (docs/DETAILS.md); "0" must therefore switch it off, as it reads.  Only "1" (or any other non-"0" value) turns
+    // it on, and unset stays off.
+    if (gdnmax_on_ = [] { const char* e = std::getenv("STRATA_METAL_GDNMAX"); return e != nullptr && e[0] != '0'; }())
+        gdnmax_ = A(16 * 128);
     st_mrope_ = R256(12 * (size_t) (MAXC + 16));
     auto act = [&](int n) {
         Act a;
@@ -2894,8 +2898,12 @@ void Window::fold(std::vector<mtl::Dispatch>& ds, int n_keep, int hp) {
                   mtl::Arg::B(ydump_), mtl::Arg::V(a), mtl::Arg::B(ghist_[1 - hp][(size_t) gi]), mtl::Arg::B(ydump_)};
         d.grid[0] = 48;
         d.tg[0] = 512;
-        nb_ = true;   // the layers' folds are independent of each other
         push(ds, d);
+        // The first fold must barrier against whatever the caller last wrote into qkvL_/alL_/beL_/zL_ (the window's
+        // own projections): setting nb_ before the push cleared the caller's `nb_ = false` and let the fold read the
+        // previous chunk's projections, committing them into the recurrent state.  Folds after the first are
+        // independent of each other, so they keep the barrier off.
+        nb_ = true;
     }
     nb_ = false;   // what follows reads the folded state: a barrier
 }
@@ -3154,9 +3162,11 @@ void log_poisoned_state(const strata::core::ConversationCheckpoint& c, float* gm
     mag[0] = 0;
     if (gmax) {
         char q[12][64];
-        // the block-0 chain fields (go/ygh/yg/bo/qkv) sit in the free slot region at bytes 1088..1152
+        // the block-0 chain fields (go/ygh/yg/bo/qkv) sit in the free slot region at bytes 1856..1920, past the
+        // hidden slots (1024..1791) and the ple group (1792..1839) - inside the hidden region they clobbered
+        // the hidden report's layers 4..8
         const float* f[12] = {gmax, gmax + 1, gmax + 2, gmax + 256, gmax + 448, gmax + 452, gmax + 456,
-                              gmax + 272, gmax + 276, gmax + 280, gmax + 284, gmax + 288};
+                              gmax + 464, gmax + 468, gmax + 472, gmax + 476, gmax + 480};
         const char* qname[12] = {"|v|", "|alpha|", "|state|", "|hid|", "|emb|", "|pkey|", "|pval|",
                                  "|go|", "|ygh|", "|yg|", "|bo|", "|qkv|"};
         const long ql[12] = {nl, nl, nl, 48, 1, 1, 1, 1, 1, 1, 1, 1};
@@ -3179,9 +3189,9 @@ void log_poisoned_state(const strata::core::ConversationCheckpoint& c, float* gm
         }
         std::snprintf(mag, sizeof mag, ", gdnmax %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s",
                       q[0], q[1], q[2], q[3], q[4], q[5], q[6], q[7], q[8], q[9], q[10], q[11]);
-        std::memset(gmax, 0, 16 * 128);   // the whole buffer: the gdn slots end at byte 576 but the hidden
-                                          // slots run to 1791 and the ple group to 1839 - a per-group sum
-                                          // (the old size) left layers >= 23 and every ple field un-cleared
+        std::memset(gmax, 0, 16 * 128);   // the whole buffer: the gdn slots end at byte 767, the hidden slots run
+                                          // to 1791, the ple group to 1839 and the chain to 1935 - a per-group
+                                          // sum (the old size) left the late layers and every ple field un-cleared
     }
     std::fprintf(stderr, "strata metal: #879s non-finite running state saved at checkpoint %zu tokens: %s%s"
                          "ple %ld, tails %ld, dead %ld%s\n", c.ids.size(), shape, hits ? ", " : "", pw, tw, dw, mag);
@@ -4199,13 +4209,16 @@ bool Window::prompt_chunk(const int32_t* tokens, int Tn, int64_t pos0, std::stri
     for (int l = 0; l < 48; ++l) {
         const std::string b = "blk." + std::to_string(l) + ".";
         // #879 instrument: the hidden stream at layer entry, in the slot region at byte 1024 (one 16-byte
-        // slot per model layer, the same gdn_max kernel into out[0]); l = 0 is skipped because mixh is the
-        // embedding output there and unwritten before the first mix.
-        if (gdnmax_on_ && l > 0)
-            D(PP(p.lgdn, "gdn_max"), {mtl::Arg::B(p.mixh), mtl::Arg::B(p.mixh),
+        // slot per model layer).  l = 0 is skipped because mixh is the embedding output there and unwritten
+        // before the first mix.  mixh is fp16 (p.mixh = F16(MT * N)), so it goes through gdn_maxh: reading an
+        // fp16 buffer as float reports the fp16 exponent bits as a magnitude (measured 4.27e+37) and walks
+        // off the end of the buffer, because the width is N (2560), not the 10240 of the projection outputs.
+        if (gdnmax_on_ && l > 0) {
+            D(PP(p.lgdn, "gdn_maxh"), {mtl::Arg::B(p.mixh), mtl::Arg::B(p.mixh),
                                       mtl::Arg::B(gdnmax_, (size_t) 1024 + (size_t) l * 16),
-                                      mtl::Arg::V(T * 10240), mtl::Arg::V(0), mtl::Arg::B(p.mixh),
-                                      mtl::Arg::V(T * 10240), mtl::Arg::V(10240)}, 1, 1, 1024);
+                                      mtl::Arg::V(T * (int) N), mtl::Arg::V(0), mtl::Arg::B(p.mixh),
+                                      mtl::Arg::V(T * (int) N), mtl::Arg::V((int) N)}, 1, 1, 1024);
+        }
         if (!sk("hc")) hc_read(b + "hc_attn", l > 0 && !(l == 1 && ple_on_));   // (the FFN read counts as moe below)
         if (l % 4 != 3) {
             if (!sk("gdn")) {
@@ -4232,10 +4245,11 @@ bool Window::prompt_chunk(const int32_t* tokens, int Tn, int64_t pos0, std::stri
             int g_ib = 4, g_gx = 48 * 4;
             if (gs == "scanr_2") g_ib = 2; else if (gs == "scanr_8") g_ib = 8; else if (gs == "scan_v") g_ib = 8;
             else if (gs == "scan_2") { g_ib = 2; g_gx = 48 * 2; } else if (gs == "scan_4") { g_ib = 1; g_gx = 48; }
-            if (gdnmax_on_)   // #879 instrument: the scan's input magnitudes and its state as the chunk starts (gdn_max)
+            if (gdnmax_on_) {   // #879 instrument: the scan's input magnitudes and its state as the chunk starts (gdn_max)
                 D(PP(p.lgdn, "gdn_max"), {mtl::Arg::B(p.gvc), mtl::Arg::B(p.al), mtl::Arg::B(gdnmax_, (size_t) gi * 16),
                                           mtl::Arg::V(T * 6144), mtl::Arg::V(T * 48), mtl::Arg::B(gst_[(size_t) gi]),
                                           mtl::Arg::V(4 * 128 * 48 * 128 / 4), mtl::Arg::V(6144)}, 1, 1, 1024);
+            }
             D(PP(p.lgdn, gk, mtl::Constants().i(6, 0), gk),
               {mtl::Arg::B(gst_[(size_t) gi]), mtl::Arg::B(p.gqn), mtl::Arg::B(p.gkn), mtl::Arg::B(p.gvc), mtl::Arg::B(p.ggb),
                mtl::Arg::B(p.gkq), mtl::Arg::B(p.go), mtl::Arg::V(ga)}, g_gx, 1, 32 * g_ib);
@@ -4244,14 +4258,18 @@ bool Window::prompt_chunk(const int32_t* tokens, int Tn, int64_t pos0, std::stri
             gemm(p.ygh, p.Wout, p.bo, T, N, 6144);
             if (gdnmax_on_ && gi == 0) {   // #879 instrument: block 0's chain - which stage lifts a healthy v to 1e5
                 // qkv (pre-projection input), go (scan output), ygh/yg (post-norm, gated), bo (out gemm); go is
-                // still valid here: gdn_post reads it and never writes it
+                // still valid here: gdn_post reads it and never writes it.  ygh is fp16 (p.ygh = F16) and the
+                // rest fp32, so ygh alone goes through gdn_maxh - reading it as float reports the fp16 exponent
+                // bits as a magnitude.  The slots sit at bytes 1856..1920, past the hidden slots (1024..1791)
+                // and the ple group (1792..1839): inside the hidden region they clobbered the hidden layers 4..8.
                 const mtl::Arg bq[5] = {mtl::Arg::B(p.qkv), mtl::Arg::B(p.go), mtl::Arg::B(p.ygh),
                                         mtl::Arg::B(p.yg), mtl::Arg::B(p.bo)};
-                const size_t oq[5] = {1088, 1104, 1120, 1136, 1152};   // slot bytes in the free region before emb (1792)
+                const char* pk[5] = {"gdn_max", "gdn_max", "gdn_maxh", "gdn_max", "gdn_max"};
+                const size_t oq[5] = {1856, 1872, 1888, 1904, 1920};   // slot bytes in the free region after ple
                 const int wq[5] = {10240, 6144, 6144, 6144, (int) N};
                 const int nq[5] = {(int) (T * 10240), (int) (T * 6144), (int) (T * 6144), (int) (T * 6144), (int) (T * N)};
                 for (int j = 0; j < 5; ++j)
-                    D(PP(p.lgdn, "gdn_max"), {bq[j], bq[j], mtl::Arg::B(gdnmax_, oq[j]),
+                    D(PP(p.lgdn, pk[j]), {bq[j], bq[j], mtl::Arg::B(gdnmax_, oq[j]),
                                               mtl::Arg::V(nq[j]), mtl::Arg::V(0), bq[j], mtl::Arg::V(nq[j]),
                                               mtl::Arg::V(wq[j])}, 1, 1, 1024);
             }

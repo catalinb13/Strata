@@ -796,21 +796,25 @@ kernel void gdn_cstate2(device float* state [[buffer(0)]], device const float* q
 // poisoned layer behind its finite companions, so NaN is propagated explicitly: on the first poisoned
 // save, a layer that was already NaN at a chunk start reads NaN, while a layer that overflowed in this
 // interval still shows its finite ramp (1e30-ish), and other small magnitudes say a race, not arithmetic.
-kernel void gdn_max(device const float* v [[buffer(0)]], device const float* al [[buffer(1)]],
-                    device float* out [[buffer(2)]], constant int& n_v [[buffer(3)]], constant int& n_a [[buffer(4)]],
-                    device const float* st [[buffer(5)]], constant int& n_s [[buffer(6)]], constant int& wv [[buffer(7)]],
-                    uint tid [[thread_position_in_threadgroup]], uint nt [[threads_per_threadgroup]]) {
+// The element type is a parameter because the buffers differ: the scan inputs are fp32, but the hidden stream
+// and the post-norm gate are fp16.  Reading an fp16 buffer through a float pointer reports the fp16 exponent
+// bits as a magnitude (measured: 4.27e+37), so the sampler and the buffer must agree.
+template <typename T>
+kernel void gdn_max_t(device const T* v [[buffer(0)]], device const T* al [[buffer(1)]],
+                      device float* out [[buffer(2)]], constant int& n_v [[buffer(3)]], constant int& n_a [[buffer(4)]],
+                      device const T* st [[buffer(5)]], constant int& n_s [[buffer(6)]], constant int& wv [[buffer(7)]],
+                      uint tid [[thread_position_in_threadgroup]], uint nt [[threads_per_threadgroup]]) {
     auto maxp = [](float a, float b) { return (a != a) ? a : ((b != b) ? b : max(a, b)); };   // NaN-propagating max
     threadgroup float redv[1024], reda[1024], reds[1024];
     threadgroup int redvr[1024];
     float mv = 0.0f, ma = 0.0f, ms = 0.0f;
     int vr = -1;   // index of the v extreme (the earliest on ties), so the host can name the token row
     for (int i = int(tid); i < n_v; i += int(nt)) {
-        const float cv = fabs(v[i]);
+        const float cv = fabs(float(v[i]));
         if (mv == mv && (cv != cv || cv > mv)) { mv = cv; vr = i; }   // a NaN mv sticks, a NaN cv replaces a finite one
     }
-    for (int i = int(tid); i < n_a; i += int(nt)) ma = maxp(ma, fabs(al[i]));
-    for (int i = int(tid); i < n_s; i += int(nt)) ms = maxp(ms, fabs(st[i]));
+    for (int i = int(tid); i < n_a; i += int(nt)) ma = maxp(ma, fabs(float(al[i])));
+    for (int i = int(tid); i < n_s; i += int(nt)) ms = maxp(ms, fabs(float(st[i])));
     redv[tid] = mv; reda[tid] = ma; reds[tid] = ms; redvr[tid] = vr;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint s = nt / 2; s > 0; s >>= 1) {
@@ -835,3 +839,6 @@ kernel void gdn_max(device const float* v [[buffer(0)]], device const float* al 
         out[2] = maxp(out[2], reds[0]);
     }
 }
+
+template [[host_name("gdn_max")]] kernel decltype(gdn_max_t<float>) gdn_max_t<float>;
+template [[host_name("gdn_maxh")]] kernel decltype(gdn_max_t<half>) gdn_max_t<half>;
