@@ -5005,6 +5005,7 @@ class Service:
         self.fifo = threading.Lock()
         self.slot_save_path = None                    # --slot-save-path: /slots/0?action=save|restore (off when None)
         self.auto_session = None                      # "auto_session": live conversation saved to this file (None = off)
+        self.sess_tried_at = 0.0                       # when a save was last ATTEMPTED; a refusal advances it too
         self.sess_saved_at = 0.0                      # when that file last held what the engine holds
         self.sess_started_at = time.time()            # the engine's current start; a turn before it is not in the file
         self.sess_needs_restore = False               # a new engine start still awaits the file read-back
@@ -5295,6 +5296,10 @@ class Service:
             return False
         if not self.fifo.acquire(blocking=False):
             return False                              # something is running or queued; the next idle round saves
+        # Count the attempt before it is made: a refusal (#879 dropped the live session, so the engine has
+        # nothing complete to save) does not advance sess_saved_at, and without this the idle loop retried it
+        # once a second for as long as the session stayed dropped - 946 identical lines in one field run.
+        self.sess_tried_at = time.time()
         try:
             r = self.engine.session_file("save", self.auto_session_path())
             self.sess_saved_at = time.time()
@@ -5328,7 +5333,8 @@ class Service:
                     continue                            # the idle saves only start after the read-back settled
                 if time.time() - (self.last_request_at or self.started_at) < self.AUTO_SESSION_QUIET_S:
                     continue
-                if (self.last_request_at or self.started_at) <= max(self.sess_saved_at, self.sess_started_at):
+                if (self.last_request_at or self.started_at) <= max(self.sess_saved_at, self.sess_started_at,
+                                                                    self.sess_tried_at):
                     continue                          # nothing new since the file was written, or the engine restarted
                 self.auto_session_save("idle")
             except Exception as e:  # noqa: BLE001 - the saver must never stop the server
