@@ -974,7 +974,8 @@ bool Window::init(const strata::core::ModelGeometry& g, strata::core::SessionSta
     // (docs/DETAILS.md); "0" must therefore switch it off, as it reads.  Only "1" (or any other non-"0" value) turns
     // it on, and unset stays off.
     if (gdnmax_on_ = [] { const char* e = std::getenv("STRATA_METAL_GDNMAX"); return e != nullptr && e[0] != '0'; }())
-        gdnmax_ = A(16 * 128);
+        gdnmax_ = A(192 * 128);   // 16-byte slots: the gdn per-layer fields, the hidden stream before and after
+                                 // group, the block-0 chain, and the scan's q / k / gate-beta
     st_mrope_ = R256(12 * (size_t) (MAXC + 16));
     auto act = [&](int n) {
         Act a;
@@ -3168,19 +3169,27 @@ void log_poisoned_state(const strata::core::ConversationCheckpoint& c, float* gm
     // fourth field samples p.mixh - the hidden stream at layer entry - at byte 1024 for all 48 model
     // layers, so the report names the layer whose OUTPUT turned non-finite (the entry of layer L is the
     // output of layer L-1); the scan fields use GDN indices, the hidden field the model layer index.
-    char mag[640];
+    char mag[2048];
     mag[0] = 0;
     if (gmax) {
-        char q[12][64];
-        // the block-0 chain fields (go/ygh/yg/bo/qkv) sit in the free slot region at bytes 1856..1920, past the
-        // hidden slots (1024..1791) and the ple group (1792..1839) - inside the hidden region they clobbered
-        // the hidden report's layers 4..8
-        const float* f[12] = {gmax, gmax + 1, gmax + 2, gmax + 256, gmax + 448, gmax + 452, gmax + 456,
-                              gmax + 464, gmax + 468, gmax + 472, gmax + 476, gmax + 480};
-        const char* qname[12] = {"|v|", "|alpha|", "|state|", "|hid|", "|emb|", "|pkey|", "|pval|",
-                                 "|go|", "|ygh|", "|yg|", "|bo|", "|qkv|"};
-        const long ql[12] = {nl, nl, nl, 48, 1, 1, 1, 1, 1, 1, 1, 1};
-        for (int j = 0; j < 12; ++j) {
+        char q[22][64];
+        // the GDN chain (qkv/go/ygh/yg) is per model layer at bytes 12288/13056/13824/14592; the scan's three
+        // other inputs (|q| and |k|, the L2-normed conv output, and |gb|, the gate/beta pair) at 4096/6144/2048;
+        // a QSA layer's three projections at 6720/7104/7488 (one slot an attention layer, so ql is the QSA count).
+        // |bo| is the MoE half of the mixer output (byte 9728) and |boa| the attention half (byte 1024): the two
+        // things hc_read folds into p.R, so together they name the mixer that writes the poison.
+        // |yr| (routed experts) and |ys| (shared expert) are per model layer too: bo = fma(sigmoid(sg), ys, yr),
+        // so whichever of the two carries the NaN names the failing half of the MoE.
+        const float* f[22] = {gmax, gmax + 1, gmax + 2, gmax + 256, gmax + 448, gmax + 4096, gmax + 456,
+                              gmax + 3264, gmax + 3456, gmax + 3840, gmax + 2432, gmax + 3072,
+                              gmax + 512, gmax + 1024, gmax + 1536,
+                              gmax + 1680, gmax + 1776, gmax + 1872, gmax + 2048, gmax + 2240,
+                              gmax + 2624, gmax + 2816};
+        const char* qname[22] = {"|v|", "|alpha|", "|state|", "|boa|", "|emb|", "|hist|", "|pval|",
+                                 "|go|", "|ygh|", "|s2|", "|bo|", "|qkv|", "|q|", "|k|", "|gb|",
+                                 "|qf|", "|kc|", "|vc|", "|hin|", "|res|", "|yr|", "|ys|"};
+        const long ql[22] = {nl, nl, nl, 48, 1, 48, 1, 48, 48, 48, 48, 48, nl, nl, nl, 12, 12, 12, 48, 48, 48, 48};
+        for (int j = 0; j < 22; ++j) {
             float mx = 0.0f;
             long ml = -1, nf = -1;
             for (long i = 0; i < ql[j]; ++i) {
@@ -3197,9 +3206,10 @@ void log_poisoned_state(const strata::core::ConversationCheckpoint& c, float* gm
             else
                 std::snprintf(q[j], sizeof q[j], nf >= 0 ? "%s %g nan r%ld" : "%s %g r%ld", qname[j], mx, rs);
         }
-        std::snprintf(mag, sizeof mag, ", gdnmax %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s",
-                      q[0], q[1], q[2], q[3], q[4], q[5], q[6], q[7], q[8], q[9], q[10], q[11]);
-        std::memset(gmax, 0, 16 * 128);   // the whole buffer: the gdn slots end at byte 767, the hidden slots run
+        std::snprintf(mag, sizeof mag, ", gdnmax %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s",
+                      q[0], q[1], q[2], q[3], q[4], q[5], q[6], q[7], q[8], q[9], q[10], q[11], q[12], q[13], q[14],
+                      q[15], q[16], q[17], q[18], q[19], q[20], q[21]);
+        std::memset(gmax, 0, 192 * 128);   // the whole buffer: the gdn slots end at byte 767, the hidden slots run
                                           // to 1791, the ple group to 1839 and the chain to 1935 - a per-group
                                           // sum (the old size) left the late layers and every ple field un-cleared
     }
@@ -3244,10 +3254,21 @@ bool Window::checkpoint_save(strata::core::ConversationCheckpoint& c, const stra
     // 4 rows (slot = cell % 4), but row 3 is written by the cell that completes the block before it is read, so it never
     // has to survive a checkpoint: rows 0..2 are the whole state (the means are identical, qsa.metal qsa_prep).
     c.gdn.resize(gst_.size() * (gs + hs));
+    size_t sbad = 0;
     for (size_t i = 0; i < gst_.size(); ++i) {
-        std::memcpy(c.gdn.data() + i * (gs + hs), gst_[i].ptr, gs);
-        std::memcpy(c.gdn.data() + i * (gs + hs) + gs, ghist_[hp_][i].ptr, hs);
+        uint8_t* d8 = c.gdn.data() + i * (gs + hs);
+        std::memcpy(d8, gst_[i].ptr, gs);
+        std::memcpy(d8 + gs, ghist_[hp_][i].ptr, hs);
+        // #879: never persist a non-finite word.  The record is restored wholesale - by this session's recovery
+        // path and by the next session's cold start - so one saved NaN re-poisons every later run from a state
+        // that looks clean.  Zero is the neutral value for both the scan state and the conv history.
+        uint32_t* w = (uint32_t*) d8;
+        for (size_t k = 0; k < (gs + hs) / 4; ++k)
+            if ((w[k] & 0x7F800000u) == 0x7F800000u) { w[k] = 0u; ++sbad; }
     }
+    if (sbad)
+        std::fprintf(stderr, "strata metal: #879 save, %zu tokens: dropped %zu non-finite words instead of persisting them\n",
+                     c.ids.size(), sbad);
     c.ple.assign((const uint8_t*) pleHist_.ptr, (const uint8_t*) pleHist_.ptr + PLEH_B);
     c.tails.resize(tail_.size() * ts);
     c.dead.resize(dead_.size() * dsz);
@@ -3270,7 +3291,7 @@ void Window::reset() {
         zero(ghist_[1][i], HIST_B);
     }
     zero(pleHist_, PLEH_B);
-    if (gdnmax_on_) zero(gdnmax_, 16 * 128);
+    if (gdnmax_on_) zero(gdnmax_, 192 * 128);
     for (size_t j = 0; j < tail_.size(); ++j) {
         zero(tail_[j], TAIL_B);
         zero(dead_[j], DEAD_B);
@@ -3315,10 +3336,31 @@ bool Window::checkpoint_restore(const strata::core::ConversationCheckpoint& c, c
     }
     pend_fold_ = 0;   // the restored state replaces whatever was pending
     last_T_ = 0;
+    // #879: the blob being restored is UNTRUSTED.  A layer of NaN cannot come out of the contractive scan (every
+    // ssm_a is negative, so the decay is <= 1 and the delta rule is bounded), so if it is already in the record it
+    // ARRIVED through the checkpoint - and #879's recovery restores this very buffer, which is what made one bad
+    // value permanent: it was saved, restored, and re-propagated on every retry.  Zero is the neutral value for
+    // both parts (the state is a memory of v, the conv history is three boundary tokens), so clearing them costs a
+    // three-token warm-up in the affected layer and nothing else.  inf is cleared with NaN: both poison the
+    // recurrence and neither is reachable from a healthy state.  This runs on restore only, so it is off the hot path.
+    const size_t sw = gs / 4, hwc = hs / 4;
+    size_t bad = 0, badl = 0;
     for (size_t i = 0; i < gsz; ++i) {
-        std::memcpy(gst_[i].ptr, c.gdn.data() + i * (gs + hs), gs);
-        std::memcpy(ghist_[hp_][i].ptr, c.gdn.data() + i * (gs + hs) + gs, hs);
+        const uint8_t* s8 = c.gdn.data() + i * (gs + hs);
+        std::memcpy(gst_[i].ptr, s8, gs);
+        std::memcpy(ghist_[hp_][i].ptr, s8 + gs, hs);
+        uint32_t* st = (uint32_t*) gst_[i].ptr;
+        uint32_t* hi = (uint32_t*) ghist_[hp_][i].ptr;
+        size_t here = 0;
+        for (size_t k = 0; k < sw; ++k)
+            if ((((const uint32_t*) s8)[k] & 0x7F800000u) == 0x7F800000u) { st[k] = 0u; ++here; }
+        for (size_t k = 0; k < hwc; ++k)
+            if ((((const uint32_t*) (s8 + gs))[k] & 0x7F800000u) == 0x7F800000u) { hi[k] = 0u; ++here; }
+        if (here) { bad += here; ++badl; }
     }
+    if (bad)
+        std::fprintf(stderr, "strata metal: #879 restore, %zu tokens: cleared %zu non-finite words from the state and "
+                             "conv history of %zu layer(s) - the checkpoint was already poisoned\n", c.ids.size(), bad, badl);
     std::memcpy(pleHist_.ptr, c.ple.data(), c.ple.size());
     const size_t cts = c.tails.size() / std::max<size_t>(tail_.size(), 1);   // 3 rows (the shared contract) or 4 (an older image)
     const size_t row = c.ids.size() / 4;
@@ -4224,18 +4266,38 @@ bool Window::prompt_chunk(const int32_t* tokens, int Tn, int64_t pos0, std::stri
     (void) MB;
     for (int l = 0; l < G_NL; ++l) {
         const std::string b = "blk." + std::to_string(l) + ".";
-        // #879 instrument: the hidden stream at layer entry, in the slot region at byte 1024 (one 16-byte
-        // slot per model layer).  l = 0 is skipped because mixh is the embedding output there and unwritten
-        // before the first mix.  mixh is fp16 (p.mixh = F16(MT * N)), so it goes through gdn_maxh: reading an
-        // fp16 buffer as float reports the fp16 exponent bits as a magnitude (measured 4.27e+37) and walks
-        // off the end of the buffer, because the width is N (2560), not the 10240 of the projection outputs.
+        // #879 instrument: byte 1024 now carries this layer's ATTENTION-half bo (sampled just before
+        // hc_read("ffn") below).  The old sample here read p.mixh BEFORE hc_read wrote it, i.e. the previous
+        // layer's value, and is superseded by the post-hc_read field.
+        // #879 instrument: p.bo exactly as hc_read is about to fold it into the residual (r[d] = fma(bo, gate, r[d])).
+        // That fma is the ONLY way the residual stream can inherit a NaN, and p.R is fp32, so this field names the
+        // mixer that wrote the poison instead of merely the layer that saw it.  bo is reused every layer, so it has
+        // to be sampled in here; reading it after the chunk would report the last layer's value.  Slots at byte 9728.
         if (gdnmax_on_ && l > 0) {
-            D(PP(p.lgdn, "gdn_maxh"), {mtl::Arg::B(p.mixh), mtl::Arg::B(p.mixh),
-                                      mtl::Arg::B(gdnmax_, (size_t) 1024 + (size_t) l * 16),
-                                      mtl::Arg::V(T * (int) N), mtl::Arg::V(0), mtl::Arg::B(p.mixh),
+            D(PP(p.lgdn, "gdn_max"), {mtl::Arg::B(p.bo), mtl::Arg::B(p.bo),
+                                      mtl::Arg::B(gdnmax_, (size_t) 9728 + (size_t) l * 16),
+                                      mtl::Arg::V(T * (int) N), mtl::Arg::V(0), mtl::Arg::B(p.bo),
                                       mtl::Arg::V(T * (int) N), mtl::Arg::V((int) N)}, 1, 1, 1024);
         }
         if (!sk("hc")) hc_read(b + "hc_attn", l > 0 && !(l == 1 && ple_on_));   // (the FFN read counts as moe below)
+        // #879 instrument: the block's REAL input - p.mixh as hc_read has just written it.  The sample above runs
+        // before hc_read, so it reads the previous layer's value; the GDN projections read this one.  Every
+        // "finite input, NaN output" reading came from comparing the wrong buffer, so this field is the one that
+        // decides whether a block inherits its poison or makes it.  Slots at byte 8192, one per model layer.
+        if (gdnmax_on_ && l > 0) {
+            D(PP(p.lgdn, "gdn_maxh"), {mtl::Arg::B(p.mixh), mtl::Arg::B(p.mixh),
+                                      mtl::Arg::B(gdnmax_, (size_t) 8192 + (size_t) l * 16),
+                                      mtl::Arg::V(T * (int) N), mtl::Arg::V(0), mtl::Arg::B(p.mixh),
+                                      mtl::Arg::V(T * (int) N), mtl::Arg::V((int) N)}, 1, 1, 1024);
+            // #879 instrument: the residual stream at this layer's entry.  The onset line says a layer's GDN
+            // inputs were already NaN while its state was still finite, so the poison arrives from above: hc_read
+            // reads p.R, and p.R is written by the previous layer's mixer.  This field names the layer where the
+            // residual itself first goes bad.  fp32, width HC*N per token; slots at byte 8960.
+            D(PP(p.lgdn, "gdn_max"), {mtl::Arg::B(p.R), mtl::Arg::B(p.R),
+                                      mtl::Arg::B(gdnmax_, (size_t) 8960 + (size_t) l * 16),
+                                      mtl::Arg::V(T * (int) (HC * N)), mtl::Arg::V(0), mtl::Arg::B(p.R),
+                                      mtl::Arg::V(T * (int) (HC * N)), mtl::Arg::V((int) (HC * N))}, 1, 1, 1024);
+        }
         if (l % 4 != 3) {
             if (!sk("gdn")) {
             const int gi = l - l / 4;
@@ -4261,6 +4323,29 @@ bool Window::prompt_chunk(const int32_t* tokens, int Tn, int64_t pos0, std::stri
             int g_ib = 4, g_gx = 48 * 4;
             if (gs == "scanr_2") g_ib = 2; else if (gs == "scanr_8") g_ib = 8; else if (gs == "scan_v") g_ib = 8;
             else if (gs == "scan_2") { g_ib = 2; g_gx = 48 * 2; } else if (gs == "scan_4") { g_ib = 1; g_gx = 48; }
+            if (gdnmax_on_) {   // #879 instrument: the scan's OTHER three inputs - q and k (gdn_pre's L2-normed conv
+                // output) and the gate/beta pair.  v and alpha are sampled just below and stay finite in every
+                // field report while the state goes NaN, so the NaN has to arrive through one of these.  The
+                // slots are past every earlier group: gb at 2048, q at 4096, k at 6144, one 16-byte slot a layer.
+                const mtl::Arg b3[3] = {mtl::Arg::B(p.gqn), mtl::Arg::B(p.gkn), mtl::Arg::B(p.ggb)};
+                const size_t o3[3] = {4096, 6144, 2048};
+                const int w3[3] = {16 * 128, 16 * 128, 96};   // row widths: 16 key heads x 128, and 48 x float2
+                const int n3[3] = {(int) (T * 16 * 128), (int) (T * 16 * 128), (int) (T * 96)};
+                for (int j = 0; j < 3; ++j)
+                    D(PP(p.lgdn, "gdn_max"), {b3[j], b3[j], mtl::Arg::B(gdnmax_, o3[j] + (size_t) gi * 16),
+                                              mtl::Arg::V(n3[j]), mtl::Arg::V(0), b3[j], mtl::Arg::V(n3[j]),
+                                              mtl::Arg::V(w3[j])}, 1, 1, 1024);
+            }
+            if (gdnmax_on_) {   // #879 instrument: the conv history gdn_pre just wrote for the NEXT chunk.  gdn_pre's
+                // first act is a 4-tap conv against this buffer, so one NaN here poisons the first tokens of every
+                // later chunk, survives chunk boundaries, and rides along in the checkpoint (it is part of c.gdn) -
+                // which is what makes the poison permanent and row-local.  fp32, 3 taps x G_CONV; slot byte 16384.
+                D(PP(p.lgdn, "gdn_max"), {mtl::Arg::B(ghist_[1 - hp_][(size_t) gi]), mtl::Arg::B(ghist_[1 - hp_][(size_t) gi]),
+                                          mtl::Arg::B(gdnmax_, (size_t) 16384 + (size_t) gi * 16),
+                                          mtl::Arg::V((int) (G_CONV * 3)), mtl::Arg::V(0),
+                                          mtl::Arg::B(ghist_[1 - hp_][(size_t) gi]),
+                                          mtl::Arg::V((int) (G_CONV * 3)), mtl::Arg::V(3)}, 1, 1, 1024);
+            }
             if (gdnmax_on_) {   // #879 instrument: the scan's input magnitudes and its state as the chunk starts (gdn_max)
                 D(PP(p.lgdn, "gdn_max"), {mtl::Arg::B(p.gvc), mtl::Arg::B(p.al), mtl::Arg::B(gdnmax_, (size_t) gi * 16),
                                           mtl::Arg::V(T * G_ZV), mtl::Arg::V(T * G_HV), mtl::Arg::B(gst_[(size_t) gi]),
@@ -4269,23 +4354,30 @@ bool Window::prompt_chunk(const int32_t* tokens, int Tn, int64_t pos0, std::stri
             D(PP(p.lgdn, gk, mtl::Constants().i(6, 0), gk),
               {mtl::Arg::B(gst_[(size_t) gi]), mtl::Arg::B(p.gqn), mtl::Arg::B(p.gkn), mtl::Arg::B(p.gvc), mtl::Arg::B(p.ggb),
                mtl::Arg::B(p.gkq), mtl::Arg::B(p.go), mtl::Arg::V(ga)}, g_gx, 1, 32 * g_ib);
+            if (gdnmax_on_) {   // #879 instrument: the state AFTER the scan.  The pre-scan sample reads the state at
+                // chunk start, so a recurrence that blows up inside the chunk looks healthy there; this one shows
+                // whether a finite input and a finite starting state still lifted the state to inf/NaN.  Slot bytes
+                // 15360 + gi*16 (per GDN layer).
+                D(PP(p.lgdn, "gdn_max"), {mtl::Arg::B(gst_[(size_t) gi]), mtl::Arg::B(gst_[(size_t) gi]),
+                                          mtl::Arg::B(gdnmax_, (size_t) 15360 + (size_t) gi * 16),
+                                          mtl::Arg::V(GST_B / 4), mtl::Arg::V(0), mtl::Arg::B(gst_[(size_t) gi]),
+                                          mtl::Arg::V(GST_B / 4), mtl::Arg::V(G_ZV)}, 1, 1, 1024);
+            }
             D(PP(p.lgdn, "gdn_post"), {mtl::Arg::B(p.go), mtl::Arg::B(p.z), mtl::Arg::B(W_, TN(b + "ssm_norm.weight").offset),
                                        mtl::Arg::B(p.ygh), mtl::Arg::B(p.yg), mtl::Arg::V(ga)}, G_HV, T, 128);
             gemm(p.ygh, p.Wout, p.bo, T, N, G_ZV);
-            if (gdnmax_on_ && gi == 0) {   // #879 instrument: block 0's chain - which stage lifts a healthy v to 1e5
-                // qkv (pre-projection input), go (scan output), ygh/yg (post-norm, gated), bo (out gemm); go is
-                // still valid here: gdn_post reads it and never writes it.  ygh is fp16 (p.ygh = F16) and the
-                // rest fp32, so ygh alone goes through gdn_maxh - reading it as float reports the fp16 exponent
-                // bits as a magnitude.  The slots sit at bytes 1856..1920, past the hidden slots (1024..1791)
-                // and the ple group (1792..1839): inside the hidden region they clobbered the hidden layers 4..8.
-                const mtl::Arg bq[5] = {mtl::Arg::B(p.qkv), mtl::Arg::B(p.go), mtl::Arg::B(p.ygh),
-                                        mtl::Arg::B(p.yg), mtl::Arg::B(p.bo)};
-                const char* pk[5] = {"gdn_max", "gdn_max", "gdn_maxh", "gdn_max", "gdn_max"};
-                const size_t oq[5] = {1856, 1872, 1888, 1904, 1920};   // slot bytes in the free region after ple
-                const int wq[5] = {G_CONV, G_ZV, G_ZV, G_ZV, (int) N};
-                const int nq[5] = {(int) (T * G_CONV), (int) (T * G_ZV), (int) (T * G_ZV), (int) (T * G_ZV), (int) (T * N)};
-                for (int j = 0; j < 5; ++j)
-                    D(PP(p.lgdn, pk[j]), {bq[j], bq[j], mtl::Arg::B(gdnmax_, oq[j]),
+            if (gdnmax_on_) {   // #879 instrument: the GDN chain of EVERY layer - qkv (pre-projection input), go
+                // (scan output), ygh/yg (post-norm, gated).  This used to sample block 0 only, which is why the
+                // first real incident (layer 5) was invisible in every report: the failing block was simply not
+                // covered.  bo is not sampled here; its attention half is the |boa| field at byte 1024.  qkv, go
+                // and yg are fp32, ygh is fp16 (so it goes through gdn_maxh).  One 16-byte slot a model layer.
+                const mtl::Arg bq[3] = {mtl::Arg::B(p.qkv), mtl::Arg::B(p.go), mtl::Arg::B(p.ygh)};
+                const char* pk[3] = {"gdn_max", "gdn_max", "gdn_maxh"};
+                const size_t oq[3] = {12288, 13056, 13824};
+                const int wq[3] = {G_CONV, G_ZV, G_ZV};
+                const int nq[3] = {(int) (T * G_CONV), (int) (T * G_ZV), (int) (T * G_ZV)};
+                for (int j = 0; j < 3; ++j)
+                    D(PP(p.lgdn, pk[j]), {bq[j], bq[j], mtl::Arg::B(gdnmax_, oq[j] + (size_t) l * 16),
                                               mtl::Arg::V(nq[j]), mtl::Arg::V(0), bq[j], mtl::Arg::V(nq[j]),
                                               mtl::Arg::V(wq[j])}, 1, 1, 1024);
             }
@@ -4304,6 +4396,19 @@ bool Window::prompt_chunk(const int32_t* tokens, int Tn, int64_t pos0, std::stri
             gemm(p.mixh, p.Wv, p.vcur, T, 512, N);
             gemm(p.mixh, p.Wiq, p.iqr, T, 512, N);
             gemm(p.mixh, p.Wik, p.ikr, T, 128, N);
+            if (gdnmax_on_) {   // #879 instrument: this attention block's projections, per QSA layer.  The GDN state
+                // one stack step down reports its own inputs NaN while every lower layer stays healthy, so the
+                // poison enters at an attention layer; these three say whether it arrives already (q/k/v NaN, i.e.
+                // inherited from mixh) or is made inside the block.  Slots past every other group (6720/7104/7488).
+                const mtl::Arg b3[3] = {mtl::Arg::B(p.qfull), mtl::Arg::B(p.kcur), mtl::Arg::B(p.vcur)};
+                const size_t o3[3] = {6720, 7104, 7488};
+                const int w3[3] = {G_QFULL, 512, 512};
+                const int n3[3] = {(int) (T * G_QFULL), (int) (T * 512), (int) (T * 512)};
+                for (int j = 0; j < 3; ++j)
+                    D(PP(p.lgdn, "gdn_max"), {b3[j], b3[j], mtl::Arg::B(gdnmax_, o3[j] + (size_t) qi * 16),
+                                              mtl::Arg::V(n3[j]), mtl::Arg::V(0), b3[j], mtl::Arg::V(n3[j]),
+                                              mtl::Arg::V(w3[j])}, 1, 1, 1024);
+            }
             QsaArgs a{(uint32_t) pos0, 0, (uint32_t) max_cells_, (uint32_t) T, eps_};
             D(PP(p.lqsa, "qsa_prep", qsa_c(), qsa_k()),
               {mtl::Arg::B(p.qfull), mtl::Arg::B(p.kcur), mtl::Arg::B(p.vcur), mtl::Arg::B(p.iqr), mtl::Arg::B(p.ikr),
@@ -4346,6 +4451,15 @@ bool Window::prompt_chunk(const int32_t* tokens, int Tn, int64_t pos0, std::stri
         }
         // ---- the MoE
         if (!sk("moe")) {   // (hc_ffn's read belongs to this class)
+        // #879 instrument: the ATTENTION half of bo (GDN: gemm(ygh, Wout); QSA: gemm(xqh, Wout)) as hc_read("ffn")
+        // is about to fold it into p.R.  The MoE half is sampled at byte 9728, so with both the residual's two
+        // writers per layer are covered and a NaN between res[l] and res[l+1] is attributable to one of them.
+        if (gdnmax_on_) {
+            D(PP(p.lgdn, "gdn_max"), {mtl::Arg::B(p.bo), mtl::Arg::B(p.bo),
+                                      mtl::Arg::B(gdnmax_, (size_t) 1024 + (size_t) l * 16),
+                                      mtl::Arg::V(T * (int) N), mtl::Arg::V(0), mtl::Arg::B(p.bo),
+                                      mtl::Arg::V(T * (int) N), mtl::Arg::V((int) N)}, 1, 1, 1024);
+        }
         hc_read(b + "hc_ffn", true);
         const gguf::Tensor &tr = TN(b + "ffn_gate_inp.weight"), &tsg = TN(b + "ffn_gate_inp_shexp.weight"),
                            &tg_ = TN(b + "ffn_gate_shexp.weight"), &tu_ = TN(b + "ffn_up_shexp.weight"),
@@ -4479,6 +4593,19 @@ bool Window::prompt_chunk(const int32_t* tokens, int Tn, int64_t pos0, std::stri
         const uint32_t oa[2] = {(uint32_t) T, N};
         D(PP(p.lib, "moe_out"), {mtl::Arg::B(p.yr), mtl::Arg::B(p.ys), mtl::Arg::B(p.sgv), mtl::Arg::B(p.bo), mtl::Arg::V(oa)},
           (T * N + 255) / 256, 1, 256);
+        // #879 instrument: the two halves of bo = fma(sigmoid(sg), ys, yr).  Whichever one carries the NaN names
+        // the failing half: yr is the routed experts (mm_combine over srt_w/YE), ys the shared expert (swiglu_h
+        // then its gemm).  fp32, width N; slots at byte 10496 (yr) and 11264 (ys), one per model layer.
+        if (gdnmax_on_) {
+            D(PP(p.lgdn, "gdn_max"), {mtl::Arg::B(p.yr), mtl::Arg::B(p.yr),
+                                      mtl::Arg::B(gdnmax_, (size_t) 10496 + (size_t) l * 16),
+                                      mtl::Arg::V(T * (int) N), mtl::Arg::V(0), mtl::Arg::B(p.yr),
+                                      mtl::Arg::V(T * (int) N), mtl::Arg::V((int) N)}, 1, 1, 1024);
+            D(PP(p.lgdn, "gdn_max"), {mtl::Arg::B(p.ys), mtl::Arg::B(p.ys),
+                                      mtl::Arg::B(gdnmax_, (size_t) 11264 + (size_t) l * 16),
+                                      mtl::Arg::V(T * (int) N), mtl::Arg::V(0), mtl::Arg::B(p.ys),
+                                      mtl::Arg::V(T * (int) N), mtl::Arg::V((int) N)}, 1, 1, 1024);
+        }
         }
         if (taps_on_ && tap_slot_[l] >= 0) tap_dispatch(ds, l, p.R, p.bo, p.inj[ci], tap_pro_buf(std::max(p.MT, T) + MAXT), T);   // DFlash2
         if (l == 0 && ple_on_) {
@@ -4509,6 +4636,30 @@ bool Window::prompt_chunk(const int32_t* tokens, int Tn, int64_t pos0, std::stri
         D(P(lib_, "gr_norm", {}, "gr_norm"), {mtl::Arg::B(p.R), mtl::Arg::B(p.bo), mtl::Arg::B(p.inj[ci]), mtl::Arg::B(W_, tn.offset),
                                               mtl::Arg::B(p.YE), mtl::Arg::V(a)}, HC, T, 256);
     }
+    // One instrument window per chunk.  The slots used to accumulate from the previous checkpoint save, which
+    // meant the report described the whole interval and could not say WHICH chunk a layer first went bad in -
+    // the one question the onset line has to answer.  Cleared here, the onset line below describes this chunk.
+    if (gdnmax_on_) std::memset(gdnmax_.ptr, 0, 192 * 128);
+    // #879: no non-finite value may cross a chunk boundary.  The scan state and the conv history are the only two
+    // carriers that outlive a chunk (and, through parking and the session checkpoint, outlive the request), so this
+    // pass makes a poisoned state self-healing instead of permanent.  It is unconditional rather than behind the
+    // instrument on purpose: containment has to hold in production, not only while diagnosing.  Zero is the neutral
+    // value for both - the state is a memory of v and the history is three boundary tokens - so a bad word costs one
+    // layer a three-token warm-up instead of poisoning every later chunk.  ~19 MB of host reads against ~14 s of
+    // prefill: 0.005%.
+    {
+        size_t sbad = 0;
+        for (size_t i = 0; i < gst_.size(); ++i) {
+            uint32_t* st = (uint32_t*) gst_[i].ptr;
+            for (size_t k = 0; k < GST_B / 4; ++k)
+                if ((st[k] & 0x7F800000u) == 0x7F800000u) { st[k] = 0u; ++sbad; }
+            uint32_t* hw = (uint32_t*) ghist_[hp_][i].ptr;
+            for (size_t k = 0; k < HIST_B / 4; ++k)
+                if ((hw[k] & 0x7F800000u) == 0x7F800000u) { hw[k] = 0u; ++sbad; }
+        }
+        if (sbad)
+            std::fprintf(stderr, "strata metal: #879 chunk start: cleared %zu non-finite words from the running GDN state\n", sbad);
+    }
     const double t0 = now_ms();
     if (stream_) {
         seg_T_ = T;
@@ -4520,6 +4671,58 @@ bool Window::prompt_chunk(const int32_t* tokens, int Tn, int64_t pos0, std::stri
     }
     pg_ms_ += now_ms() - t0;
     pg_tok_ += T;
+    // #879 instrument: which chunk first leaves a non-finite running state, and in which GDN layer.  The
+    // checkpoint report cannot say: it samples the state at a chunk START, so it shows that the poison exists
+    // but never the chunk that made it, and a poisoned state at chunk N means chunk N-1's work did it.  The
+    // state is unified memory, so the host reads it directly once the chunk's graph has completed; 786432
+    // words a layer costs a few ms against a chunk's ~11 s of prefill.
+    if (gdnmax_on_) {
+        static bool said[64] = {}, crossed[64] = {};
+        const float* gx0 = (const float*) gdnmax_.ptr;
+        for (size_t g = 0; g < gst_.size() && g < 64; ++g) {
+            const bool sampler_nan = (gx0[4 * g + 2] != gx0[4 * g + 2]);   // the |state| slot for this layer
+            if (said[g] && !(sampler_nan && !crossed[g])) continue;
+            const uint32_t* w = (const uint32_t*) gst_[g].ptr;
+            const size_t nw = (size_t) 4 * 128 * 48 * 128 / 4;
+            size_t first = nw, cnt = 0;
+            float mx = 0.0f;
+            for (size_t i = 0; i < nw; ++i) {
+                if ((w[i] & 0x7F800000u) == 0x7F800000u) { if (first == nw) first = i; ++cnt; }
+                else { const float f = std::fabs(*(const float*) &w[i]); if (f > mx) mx = f; }
+            }
+            if (first == nw) {
+                // The slot sampler and this scan read the same buffer.  When the sampler reports NaN and this
+                // scan finds none, one of the two is wrong and every per-field attribution built on these slots
+                // is untrustworthy - so say it once a layer instead of letting the two stories diverge silently.
+                if (sampler_nan && !crossed[g]) {
+                    crossed[g] = true;
+                    std::fprintf(stderr, "strata metal: #879m chunk pos %lld: GDN layer %zu: the |state| slot says NaN, "
+                                 "this scan of gst_[%zu] finds none (%zu words, max finite %.6g) - the instrument "
+                                 "disagrees\n", (long long) pos0, g, g, nw, (double) mx);
+                }
+                continue;
+            }
+            crossed[g] = true;       // sampler and this scan agree (both non-finite): nothing to reconcile
+            if (said[g]) continue;   // ...and this layer was already reported: once a layer, not once a chunk
+            said[g] = true;
+            // `cnt` says which mechanism: a whole block (all 786432) is a scalar that went NaN for every
+            // element (the decay g or beta, one per head), a few words is a localized write.  The per-chunk
+            // window then says whether this layer's own inputs were already non-finite in THIS chunk, or
+            // whether the scan had finite inputs and produced the poison itself.
+            const float* gx = (const float*) gdnmax_.ptr;
+            const size_t lmod = g + g / 3;   // this GDN layer's model layer (gi = l - l/4), for the res/hin slots
+            std::fprintf(stderr, "strata metal: #879c chunk pos %lld, %d rows: GDN layer %zu non-finite from word %zu, "
+                         "%zu of %zu words bad, bits %08x, max finite %.6g | this chunk: state %.6g (max at chunk start), "
+                         "v %.6g, alpha %.6g, q %.6g, k %.6g, gb %.6g, res %.6g, bo %.6g | chain of model layer %zu: "
+                         "qkv %.6g, go %.6g, ygh %.6g, boa %.6g, hist %.6g, s2 %.6g\n",
+                         (long long) pos0, T, g, first, cnt, nw, w[first], mx,
+                         (double) gx[4 * g + 2], (double) gx[4 * g], (double) gx[4 * g + 1],
+                         (double) gx[1024 + 4 * g], (double) gx[1536 + 4 * g], (double) gx[512 + 4 * g],
+                         (double) gx[2240 + 4 * lmod], (double) gx[2432 + 4 * lmod], lmod,
+                         (double) gx[3072 + 4 * lmod], (double) gx[3264 + 4 * lmod], (double) gx[3456 + 4 * lmod],
+                         (double) gx[256 + 4 * lmod], (double) gx[4096 + 4 * g], (double) gx[3840 + 4 * g]);
+        }
+    }
     static const bool trace = std::getenv("STRATA_METAL_TRACE") != nullptr;
     if (trace) std::fprintf(stderr, "strata metal: prompt chunk pos %lld, %d rows: %.0f ms\n", (long long) pos0, T, now_ms() - t0);
     // the window's state after the chunk: the conv history turned, the PLE history and token window advanced

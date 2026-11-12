@@ -426,7 +426,11 @@ kernel void qsa_merge(device const float* part [[buffer(0)]], device const float
         L = fma(q[QD + 1], e, L);
         o = fma(q[tid], e, o);
     }
-    o = o / L;
+    // An empty row leaves M at -INFINITY (the sentinel qsa_attn writes for a chunk with no cells), and
+    // exp(-inf - -inf) is NaN, so every e and L are NaN too; a bare divide then writes a canonical qNaN into
+    // xp and from there into the residual stream.  An empty row means nothing to attend to, so zero is the
+    // right answer and it is what the rest of the path already assumes.  (L > 0 is false for NaN as well.)
+    o = (L > 0.0f) ? o / L : 0.0f;
     const float gate = qfull[(t * QH + h) * 2 * QD + QD + tid];
     const float y = o * (1.0f / (1.0f + exp(-gate)));
     // prepared planes (xprep layout) of the n = QH * QD vector
