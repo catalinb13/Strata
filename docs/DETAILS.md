@@ -1186,6 +1186,21 @@ print(r.choices[0].message.content)
   with no non-finite value up to 10,000 times that amplitude. What is left of the origin is therefore the model's own
   data, and the guard's position line is the field probe: a natural fire prints where in the context the first
   poisoned window sat, which pins the repro.
+  The origin was found in the Metal port on 2026-11-12: the MoE expert activations are fp16 (`XS` is the gathered
+  input, `HS` the gated intermediate), and a value outside fp16's range became `inf`. The expert down-GEMM
+  multiplies those activations by quantized weights that are legitimately zero, so `inf * 0` produced a canonical
+  NaN (`0x7fc00000`) in one token row's combined expert output. That row's residual, then every layer above it,
+  then the GDN scan state went NaN, and the window's logits with them. Four things hid it: it is one row, so a
+  magnitude report shows only "a NaN somewhere"; the layer varies with the routing; there is no ramp, because the
+  inputs are all O(1) and the NaN is a bit-level product rather than an overflow of the value reported; and the
+  GDN state and conv history are part of the checkpoint and of the parked conversation, so one bad value came
+  back with every later turn. Every fp16 activation store on the expert path now saturates to +/-65504 (`hsat` in
+  `metal/kernels/moe_mm.metal`), `mm_combine` drops a non-finite term instead of summing it, and non-finite words
+  are cleared from the GDN state and conv history at every prompt chunk start, on checkpoint restore and on
+  checkpoint save (that pass costs 19 MB of host reads against about 14 s of prefill, 0.005%). Four consecutive
+  deep probes of 104,748 cold prompt tokens then finished with no non-finite logits and nothing to clear, where
+  the previous build poisoned on about seven of eight. A saturating store and a dropped non-finite term only
+  differ from the old result where that result was already non-finite, so finite answers are unchanged.
   A flagged window emits none of its tokens, the engine prints one
   `non-finite logits (#879)` line with the position, ends the request with `DONE ... nonfinite` (a slot:
   `BDONE <slot> <n> nonfinite`), and the next request first drops the live session, every checkpoint, every parked
