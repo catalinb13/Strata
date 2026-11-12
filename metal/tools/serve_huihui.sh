@@ -120,6 +120,9 @@ sys.exit(0 if text.strip("! \t\r\n") else 1)
 
 start() {
     if [ -n "$(port_pid)" ]; then say "ERROR: something already answers on $PORT; refusing to start a second engine"; return 1; fi
+    # A stale engine binary fails silently: the config's exe is whatever was last built, so a source edit that was
+    # never compiled into it is simply absent from the run. Warn (never refuse) so it is never a mystery.
+    sh "$ROOT/metal/tools/engine_freshness.sh" "$CFG" || true
     say "starting: serve/server.py --engine strata --config $CFG --port $PORT"
     cd "$ROOT" || return 1
     nohup "$PY" serve/server.py --engine strata --config "$CFG" --port "$PORT" >> "$RLOG" 2>&1 &
