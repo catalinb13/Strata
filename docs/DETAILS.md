@@ -1749,7 +1749,16 @@ session file, named `auto-session` unless NAME says otherwise, in the `slot_save
 it itself: after each request it waits ten seconds of quiet and writes the conversation the engine holds, and when
 the engine starts - at boot or after a restart - it reads that file back before the first request runs, so the
 parking comes back across a server restart. Measured on the M1 Max (2026-11-05, huihui Q4_K_XL): saving 212 tokens
-takes 228 MB and 178 ms; the read-back costs the same file read. A save never delays a request: it takes the same
+takes 228 MB and 178 ms; the read-back costs the same file read.
+The file never shrinks. The engine holds only the most recent request's conversation, and an auxiliary one (a title,
+a summary, a one-line side question) takes that slot, so the idle save would otherwise write the small conversation
+over the real one - and every parked conversation lives in RAM and dies with the process, so that file is the only
+durable record. Each save is therefore written beside the file (NAME.next) and replaces it only when it holds at
+least as many tokens as the file already does; a smaller one is dropped with
+`auto-session: kept the N-token file; this engine session held only M tokens`. Measured on the M1 Max
+(2026-11-12): the file held 912 tokens while the conversation it belonged to was 75,924, and the restart after
+that had nothing to read back, so the next request re-read all 75,924 tokens.
+A save never delays a request: it takes the same
 FIFO as a request and only runs when nothing is running or queued, and a file that no longer fits (another model or
 engine version, a half-written file) is refused and the first request simply reads from 0, exactly as without the
 feature. It needs `slot_save_path` (or `--slot-save-path DIR`) and is off with parallel requests (`"parallel"` /

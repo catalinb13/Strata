@@ -5007,6 +5007,7 @@ class Service:
         self.auto_session = None                      # "auto_session": live conversation saved to this file (None = off)
         self.sess_tried_at = 0.0                       # when a save was last ATTEMPTED; a refusal advances it too
         self.sess_saved_at = 0.0                      # when that file last held what the engine holds
+        self.sess_saved_tokens = 0                    # how many tokens that file holds: a smaller save never replaces it
         self.sess_started_at = time.time()            # the engine's current start; a turn before it is not in the file
         self.sess_needs_restore = False               # a new engine start still awaits the file read-back
         self.embeddings = threading.local()           # the current request's image embeddings file (GENI)
@@ -5280,6 +5281,7 @@ class Service:
         try:
             r = self.engine.session_file("restore", path)
             self.sess_saved_at = time.time()          # the engine now holds exactly what the file holds
+            self.sess_saved_tokens = r["tokens"]      # the file's size: a later, smaller conversation must not replace it
             print(f"[strata] auto-session: restored {r['tokens']} tokens from {self.auto_session} in "
                   f"{r['ms']:.0f} ms", flush=True)
         except SessionRefused as e:
@@ -5301,11 +5303,30 @@ class Service:
         # once a second for as long as the session stayed dropped - 946 identical lines in one field run.
         self.sess_tried_at = time.time()
         try:
-            r = self.engine.session_file("save", self.auto_session_path())
-            self.sess_saved_at = time.time()
-            print(f"[strata] auto-session: saved {r['tokens']} tokens, {max(1, r['bytes'] >> 20)} MB in "
-                  f"{r['ms']:.0f} ms{f' ({why})' if why else ''}", flush=True)
-            return True
+            # Save beside the file and keep whichever holds more.  The engine holds only the MOST RECENT request's
+            # conversation, and an auxiliary one (a title, a summary, a one-line side question) takes that slot, so
+            # the idle save used to write the small conversation over the real one: the file then held 912 tokens
+            # while the conversation it belonged to was 75,924, and the next engine start had nothing to restore.
+            # Every parked conversation lives in RAM and dies with the process, so this file is the only durable
+            # record of a conversation and must never shrink.  Same-size saves still replace, so a re-save of the
+            # same conversation refreshes its checkpoints.
+            path = self.auto_session_path()
+            side = path + ".next"
+            r = self.engine.session_file("save", side)
+            if r["tokens"] >= self.sess_saved_tokens:
+                os.replace(side, path)
+                self.sess_saved_tokens = r["tokens"]
+                self.sess_saved_at = time.time()
+                print(f"[strata] auto-session: saved {r['tokens']} tokens, {max(1, r['bytes'] >> 20)} MB in "
+                      f"{r['ms']:.0f} ms{f' ({why})' if why else ''}", flush=True)
+                return True
+            try:
+                os.remove(side)
+            except OSError:
+                pass
+            print(f"[strata] auto-session: kept the {self.sess_saved_tokens}-token file; this engine session held only "
+                  f"{r['tokens']} tokens (an auxiliary conversation, not the one on file)", flush=True)
+            return False
         except SessionRefused as e:
             print(f"[strata] auto-session: the save was refused ({e}); trying again when the engine next idles",
                   flush=True)
