@@ -6,6 +6,7 @@
 //   gdn_parity --bench    GPU time per layer: 36 distinct layer states rotated (113 MB, beyond the SLC)
 #include "mtl_rt.h"
 #include "ref_quant.h"
+#include "engine/geo.h"
 
 #include <algorithm>
 #include <cmath>

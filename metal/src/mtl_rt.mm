@@ -358,6 +358,21 @@ bool build_source(const std::string& ggml_common_path, const std::string& kernel
         ss << in.rdbuf();
         src += "#line 1 \"" + f + "\"\n" + ss.str() + "\n";
     }
+    if (const char* dump = std::getenv("STRATA_METAL_MSL_DUMP")) {   // research: the full text of every library, as the compiler gets it
+        static int ndump = 0;
+        char name[32];
+        std::snprintf(name, sizeof name, "/%03d.msl", ndump++);
+        if (std::FILE* f = std::fopen((std::string(dump) + name).c_str(), "wb")) {
+            std::fwrite(src.data(), 1, src.size(), f);
+            std::fclose(f);
+        }
+        if (std::FILE* f = std::fopen((std::string(dump) + "/index.txt").c_str(), "ab")) {
+            std::fprintf(f, "%s:", name + 1);
+            for (const auto& fl : files) std::fprintf(f, " %s", fl.c_str());
+            std::fprintf(f, "\n");
+            std::fclose(f);
+        }
+    }
     return true;
 }
 

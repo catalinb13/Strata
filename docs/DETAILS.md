@@ -769,7 +769,7 @@ slowly, the engine prints a hint under its `loaded ... GiB at ...` line naming t
 The same questions, the same automatic install (it uses `sudo apt` for Python and, only if it has to compile,
 for the build tools), and the same start: `http://127.0.0.1:8080`. Later runs of `./setup.sh` (or `./run-<model>.sh`)
 start the model directly. Options as on Windows (`./setup.sh --setup`, `--model Q2_0 --yes`, `--gguf-dir /data/Q2_0`).
-Terminal chat: `.venv/bin/python chat.py`.
+Terminal chat: `.venv/bin/python tools/chat.py`.
 Building from git, trying a pull request, the monitor from a checkout: [INSTALL.md](INSTALL.md#build-from-git-on-linux-to-try-a-pull-request-or-change-the-code).
 
 - **Updating:** `git pull`, then `./setup.sh`: it compiles the engine again when its source changed (a minute or
@@ -800,6 +800,130 @@ Use the file names and the revision setup shows for your model (the revision abo
 Keep the file's original name. Setup finds the files in `--gguf-dir`, checks their SHA-256 and does not download them again; a file that does not match the published one is
 reported and, for files in your own folder, never deleted. Without `uvx`, `pip install -U huggingface_hub` gives the same `hf` command.
 
+## Memory modes
+
+### KV cache
+
+| Option | What it does |
+| --- | --- |
+| `--kv int8` (default) | 8-bit KV cache. |
+| `--kv q4_0` | Half the KV memory with a Hadamard rotation before 4-bit rounding. About 4% faster at 128K, measurably less precise on long documents (perplexity +8-12%; needle tests still pass). Setup asks above 8K context. |
+| `--kv k8v4` | Keys at 8 bits, values as rotated 4-bit: 23% less KV memory than 8-bit, so more experts fit in VRAM. More precise than `q4_0` on long documents. Prompts are 2-5% slower. |
+| `--kv-streaming on\|off\|auto` | Keeps the context's KV cache in RAM and only the part attention reads in VRAM (`--kv-resident 32768`), so more experts fit on the GPU. Costs about 13.7 KB of RAM per context token (1.7 GB at 128K). Setup turns it on from 64K when the RAM has room; `on` overrides the RAM test with a note. Never under WSL. |
+| `--kv-grow` (or `STRATA_KV_GROW=1`; `--no-kv-grow` turns it off) | The KV takes VRAM only for the cells the requests reach; the expert cache holds the rest and gives slots back as the context grows. Needs one GPU, an expert profile, the whole KV in VRAM and every expert in RAM. Otherwise the engine says so and stays off. On HIP it uses virtual memory management (`STRATA_HIP_VMM=0` turns that off). It pays on cards of about 24 GB or less with contexts of 128K and more. |
+
+`STRATA_KV_HOST_REGISTER=1` forces the KV host copy to be pinned with `cudaHostRegister` (the order WSL2 uses
+automatically); `0` forces `cudaHostAlloc` first.
+
+### Low-RAM modes (chosen by setup)
+
+Normally all of a model's experts are copied into RAM (23-50 GB, pinned) and the GPU holds a copy of the most-used ones.
+When the RAM cannot hold them beside the system (the experts plus about 10 GB), setup picks one of these:
+
+| Mode | Flag | What it does |
+| --- | --- | --- |
+| Mapped | `--mmap-experts` | Maps the experts from one file in the model's folder (the pack's `experts.bin`, +23-50 GB of disk), or from the GGUF files themselves for native packs that have no `experts.bin`. The OS file cache holds what the GPU does not and can give that memory back. With a small GPU most experts come from the SSD and it is much slower; setup says so. |
+| Resident | `--resident-experts` | When the experts the GPU does not hold fit the RAM, the engine copies exactly those into RAM at start. Nothing is read from the SSD while it answers. |
+| RAM budget | `--resident-budget-gib N` | The N GiB of experts the GPU does not hold that the profile ranks hottest are copied into RAM; the rest are read from the files. Implies `--mmap-experts` and leaves 4 GiB of headroom. On Windows the available commit limit also caps N, and a clamped budget is reported. This is what runs [Unsloth's UD-Q4_K_XL](UNSLOTH_Q4.md) on a 64 GB PC. |
+
+- In a source checkout, `START-HERE.bat --setup --low-ram on|off` overrides the choice, and `--low-ram resident|mmap` forces one variant.
+- The resident variant keeps 4 GB of the RAM it finds free (`STRATA_RESIDENT_HEADROOM_GIB`). When even the missing experts do
+  not fit, it says so and runs the mapped mode. The server log shows per request how many expert reads went to the file
+  (`resident RAM: ... blob reads from the file`, 0 in steady use).
+- The adaptive tier (`--adapt-every`) keeps following the conversation in the resident mode. `--adapt-async 1` (opt-in,
+  `--serve`) moves the swaps between decode windows on a helper thread. With `--batch` slots it works between their
+  windows too, but not with `--batch-groups` or `--peer-device`. It is not bit-exact from run to run.
+- `STRATA_RAM_ADAPT=<n>` (opt-in, `--serve`, one GPU, needs `--adapt-every`): the RAM copy also follows the conversation.
+  A layer swaps up to 4 pairs per window: the experts the windows keep routing to (decayed count 2 or more) take the
+  RAM places of unused experts of the same layer (count below 0.5), largest difference first. The incoming expert was
+  usually read for the window before; when its blob still sits in that read's stage buffer it is copied from there and
+  no file read is made. `n` caps only the pairs that need a file read (`=1` is enough in practice). The log counts how
+  many experts moved and how many came out of a stage buffer.
+- Several GPUs: setup recommends one GPU in the low-RAM mode and asks. `--gpus 0,1` shares the model across both cards
+  ([MULTI_GPU.md](MULTI_GPU.md#using-it)). `--yes` keeps one GPU.
+- With a page-locked copy the GPU also takes its share of the misses over PCIe (`--pcie-frac`). `--pcie-frac 0` (or
+  `STRATA_RESIDENT_PIN=0`) gives the mapped mode's exact tokens.
+- Linux, opt-in: `STRATA_ARENA_MMAP=1` maps a native pack's expert arena read-only from `experts.bin` instead of reading
+  it into locked RAM (for example 2x 16 GB GPUs with 32 GB of RAM). Run it with `--pcie-frac 0`.
+- Windows, opt-in: `STRATA_FILE_RELEASE=1` trims the file-backed pages of experts after their GPU uploads. It is a
+  working-set hint, not an unmap, and it does not reduce committed memory or SSD reads
+  ([measurements and limits](../bench/results/2026-10-04-windows-mapped-release/README.md)).
+- Windows, opt-in: `STRATA_PIN_BY_NEED=1` (arena on one GPU) registers the profile's non-GPU-resident experts by rank up to
+  `STRATA_ARENA_PIN_GIB` (29 by default on Windows) instead of the first ~30 GiB.
+- Windows CUDA keeps 640 MiB then 160 MiB of page-lockable memory free while the arena pins (`STRATA_PIN_RESERVE_MIB=N`, `0`
+  turns it off, and it sets the reserve on any OS). If a required buffer is still refused, the error ends with
+  `[pinned-memory-exhausted]` and names the `STRATA_ARENA_PIN_GIB` to start with.
+- `STRATA_EXCHANGE_ROTATE=1` (opt-in): an adaptive swap hands buffer ownership over instead of copying the evicted blob into
+  the RAM copy. Same tokens, fewer host copies, about 1.4 GiB more page-locked RAM. See
+  [EXCHANGE_ROTATION.md](EXCHANGE_ROTATION.md).
+
+### Linux file tier
+
+When experts are read from GGUF files in place, Linux runs three things by default. Off switches are in brackets.
+
+| Part | Variable | What it does |
+| --- | --- | --- |
+| Zero-copy | `STRATA_COLD_OVERLAP=4` (`0` = off) | An expert whose three tensors' pages are all in the page cache is computed straight from the mapping, with no staging copy. |
+| io prefetch | `STRATA_IO_PREFETCH=1` (`0` = off) | I/O threads read the layer's uncached experts and the router-predicted ones of the next layers with whole-blob `pread`s into the page cache. Tunables: `STRATA_LOOKAHEAD_K`, `STRATA_IO_PREFETCH_DEPTH` (2), `STRATA_IO_PF_THREADS` (8), `STRATA_IO_PF_STAGE=1`, `STRATA_IO_PF_AHEAD=0`. |
+| Decode gate | `STRATA_IO_PF_GATE=1` (`0` = off) | Every 16 decode windows the read-ahead is judged. It runs only while the page cache has room for the experts (off below 0.55, on above 0.65: `STRATA_IO_PF_GATE_LO` and `_HI`) and while it pays (`STRATA_IO_PF_GATE_USEFUL`). |
+
+For an `experts.bin` pack, io prefetch and the gate switch on when the page cache has room for at least 55% of the experts
+(the tightest cgroup limit or `MemAvailable`, asked once at start). Below that the pack reads as before and the log says so;
+`STRATA_IO_PREFETCH=1` forces it. The container RAM check counts a cgroup's clean page cache as available. The startup log
+names what is on. When every expert is in the GPU caches (the decode reads nothing from the file tier) the defaults, the decode gate and the routing-aware prefetch are off, and they come back when a request starts with fewer experts held (a VRAM resize, an eviction); `STRATA_IO_PREFETCH=1` keeps io prefetch and the look-ahead, `STRATA_LOOKAHEAD=1` keeps the look-ahead, `STRATA_FILE_TIER_IDLE=0` turns this off. Windows and macOS are unchanged. On a Radeon 780M iGPU, prefetch together with the adaptive tier under
+memory pressure reset the GPU in most runs; with `--adapt-every 100000` there were none, and the cause is not found.
+
+The weights and the MTP draft files are asked for ahead of their reads at start (madvise and `posix_fadvise` WILLNEED, 128 KiB
+steps), which matters on a slow drive: `STRATA_READ_AHEAD=0` turns it off, `STRATA_FILL_AHEAD=N` sets how many fill pairs
+are requested ahead (default 256).
+
+The prompt chunk follows the host's memory (Linux, file tier, on by default). When the page cache is smaller than the file
+set, a planner picks the chunk and ring with the fewest predicted bytes read per prompt from the RAM copy, the page cache that
+is left, the drive class and the PCIe link. It prints `chunk 8192 -> 3840, ring 96 -> 96: ...` when it changes the pick and
+`chunk 8192 kept: ...` when it does not. It does nothing when the GPU holds every expert, when the file set fits the cache,
+and on Windows. `STRATA_PREFILL_HOST_PLAN=0` turns it off; `STRATA_SSD_GBPS` overrides the drive speed;
+`--prefill N` and `STRATA_PREFILL_RING` always win.
+
+### Reading the tiers
+
+With `--stats` the engine prints the tiers of the decode (`expert tiers`: blobs from the RAM copy, blobs and MB from the
+files, read time; `routing prefetch`: how many file reads had been warmed). The server log has the same per request, and
+`GET /metrics` lists `ram_blobs`, `file_blobs`, `file_mb`, `drafts_offered` and `drafts_accepted` per recent request, with
+`totals` since the start. `hit_rate` is the VRAM share of the experts looked up; experts the GPU reads over PCIe
+(`--pcie-frac`) are not in it, so a higher `--pcie-frac` raises it even when decoding gets slower. `pcie_share` is their
+share of all routed experts. The Monitor tab shows both. The request list in the Monitor tab also shows the prompt's own speed: what the cache already held is not read
+again, so it is the fresh tokens (`prompt_tokens` minus `reused`) over the prompt time (`prompt_ms`), and a request that read no
+new token shows no number.
+
+Profiling: start the server with `STRATA_DECODE_TIMING=1` (and `STRATA_VERIFY_PROFILE=1` for the GPU side). After each request
+the engine log has a `strata decode timing:` line and a `strata decode GPU stages (ms/window):` line. The GPU profile slows
+decoding a little: use it to compare, not to measure speed. `STRATA_LOOKAHEAD_STATS=1` scores the next-layer expert
+prediction every 100 windows and costs CPU. `tools/replay_cache_policy.py` replays a `--dump-routing` trace through the
+adaptive tier's swap policy offline.
+
+In the serial serve loop the timing line lists the wall-time parts in the order they run: `adapt wait + verify +
+commit/emit + draft + adapt join + other`. `other` is the decode time minus the named parts, not a step of its own.
+The times are host wall times, averaged over every decode window, and the bracketed parts of verify are already inside
+verify. The pipelined decode keeps the older line (`ms/window = verify ...`) and batch slots are not covered, so a script
+that reads this line must accept `ms/window = adapt wait` for a serial run.
+
+### Draft layer
+
+| Option | Effect |
+| --- | --- |
+| `--mtp` | Use the model's MTP draft layer (setup passes it). The server also runs without it: drafts then come from the suffix and prompt-lookup drafter only, every token is still verified, and the draft layer's ~0.7-1 GiB of VRAM goes to the expert cache. |
+| `--spec N`, `--spec-min-p P` | Draft depth and the confidence needed to add a guess. Setup's default is `--spec 4 --spec-min-p 0.5`. |
+| `--draft-vocab en\|cyrillic\|fr` (setup) | The draft layer can only propose tokens from a subset of the vocabulary. The default subset includes every Chinese, Japanese and Korean token. `en` keeps the English and code subset (~110 MiB less VRAM, English 1-2% faster, CJK gets almost no drafts). `cyrillic` and `fr` add those scripts. `tools/draft_vocab.py` builds and inspects subsets. |
+| `--lookup-chain-min M`, `--mtp-hnorm stream`, `--mtp-draft-vocab FILE` | Finer controls: the shortest context match `--lookup-chain` extends (default 3), one norm per stream, and a token subset of your own. |
+
+When the start stops with "the draft head does not fit" (a 12 GB card with a long context), the engine says how much it needs
+and which smaller subset fits. Setup suggests `--draft-vocab en` on cards under 14 GB; nothing changes unless you pass it.
+
+**Reproducible output.** With the IQ models the CPU rounds one-token expert groups and multi-token groups differently, so the
+same prompt at temperature 0 can end in a different, equally good answer when drafting, cache state or a resumed conversation
+differ. `STRATA_IQ_MT_MIN=1` uses the multi-token kernels for every group, so the answer no longer depends on drafting (IQ3_S
+decode -1 to -3% on a Ryzen 7600). For byte-identical repeats also add `--prompt-cache 0 --adapt-swaps 0 --pcie-frac 0` to
+the engine args. `--pcie-frac 0` costs decode speed, so keep it for A/B runs.
 
 ---
 
@@ -1320,6 +1444,19 @@ window and ignored, and a malformed field is a 400. One pinned prefix at a time 
 it needs `--prompt-cache 3` or more. `tools/research_run.py` runs a document and a question list against a server with and
 without it. The engine's own key is `pin=N` on the `GEN` line.
 
+| Option | Effect |
+| --- | --- |
+| `--prompt-cache N` | Number of checkpoints (`0` = off, which also disables parking). |
+| `--prompt-cache-every N`, `--prompt-cache-root N`, `--turn-token ID` | Checkpoint interval, the system-prompt checkpoint (`0` = none) and the turn token. The interval is not a piece-size setting: [what it does](PROMPT_CACHE_TAIL.md#--prompt-cache-every-does-not-set-the-size-of-the-pieces-a-prompt-is-read-in). |
+| `--prompt-cache-spread` (opt-in) | The checkpoint that leaves is the one whose removal leaves the smallest gap, so the kept points thin out geometrically back from the end. An agent that rewrites its history a few thousand tokens back then resumes near the edit instead of at the system prompt. Same RAM. |
+| `"strata_checkpoint": false` (per request) | A one-shot request that no later request continues saves no checkpoints and keeps no session. |
+| `"strata_prefix": {"messages": 1}` (per request, opt-in) | One long document, many questions. Marks where the document ends: `{"messages": 1}`, `{"message": 0, "chars": 210000}` or `{"tokens": 12345}`. The checkpoint at the boundary is pinned, so 20 questions cost one read of the document. One pinned prefix at a time per engine; needs `--prompt-cache 3` or more; a malformed field is a 400. See [RESEARCH_RUNS.md](RESEARCH_RUNS.md). |
+| `--conversation-cache-mib N`, `--conversation-cache-slots N` | Park conversations in a bounded host-RAM cache so alternating requests (controller and worker histories, sub-agents) reuse their prompts. Without `--conversation-cache-mib` the budget is 40% of the RAM left above `--conversation-cache-min-free-mib` once the model is loaded, at most 8192 MiB in steps of 256, off when under 1024; the engine log says which. `0` turns it off. It preserves histories; it does not run requests at once. |
+| `--conversation-cache-min-tokens N` | Park only conversations of at least N tokens, so short side requests do not evict a long conversation. Default `0` (park all). |
+| `--conversation-cache-park-gain N` (opt-in) | Park a conversation again only after it advanced N tokens past the copy it would replace. |
+| `--conversation-cache-min-free-mib N` | RAM floor, default 2560. Parking and session files are skipped when less than the snapshot plus the floor is available. |
+| `--memory-limit-mib N` (or `STRATA_MEMORY_LIMIT_MIB`) | Total RAM this engine's container may use, for when a container cannot see its own limit. Config `args`: `"--memory-limit-mib", "102400"`. `0` = none. |
+
 **Multiple conversations (opt-in).** Add `--conversation-cache-mib 8192
 --conversation-cache-slots 4` to the engine arguments to park up to four conversations
 in a bounded 8 GiB host-RAM cache. This preserves controller/worker histories when
@@ -1338,7 +1475,7 @@ reported separately from Linux/CUDA evidence.
 **When the arena does not fit in the RAM that is free (#4051).** The engine checks the RAM before it reads the experts into the
 arena. A memory limit below the arena (a container) stops the start with the numbers. Less free RAM than the arena (an engine
 that was still exiting, another program) is waited for up to 20 s, and the log says so (`STRATA_ARENA_RAM_WAIT_S` changes the
-seconds, `0` loads at once); if it is still short the load goes on with a warning that says how much, never a refusal. Below half
+seconds, `0` loads at once). On Linux, if free memory, file cache or a reserved huge-page pool can hold the experts, they load anyway with a warning; otherwise the run reads them from the file. `STRATA_ARENA_FILE_CACHE=0` always reads from the file. Below half
 of the arena the warning adds that the whole PC can stall in memory reclaim, and that a systemd `MemoryHigh=` below the RAM keeps
 one program from taking all of it. The server, before it starts an engine, ends one that an earlier run left behind and now waits up
 to 120 s for it to be gone (it used to wait 10 s): an engine with tens of GB of pinned memory needs longer to give it back, and the
@@ -1360,6 +1497,9 @@ in a RAM copy, as much as the RAM available at the start allows after a headroom
   the safety headroom. The explicit modes (`--resident-budget-gib N`, `--resident-experts`) leave `max(W, their own 4 GiB)`.
 - The app's "Leave 20% for my work" passes W = clamp(ceil(0.2 x RAM in GB), 5, 8) as `STRATA_RAM_KEEP_GIB` in the run config's env (not as the flag, so an older engine chosen in the Engine tab, which ignores an env variable, still starts); `strata serve` and full performance pass nothing.
 - `STRATA_ARENA_FALLBACK_RESIDENT=0` keeps the plain file source for the fallback (testers).
+- The RAM copy is page-locked. `STRATA_RESIDENT_PIN=0` keeps it in ordinary pageable memory, as with `--resident-budget-gib`. Under a
+  tight memory limit the system can then swap part of it out: with a 51.75 GiB limit on an R9700 PC (explicit 45.24 GiB budget, one run)
+  prompts read at 920 against 1,754 tok/s and decoding ran at 77.7 against 83.3 tok/s.
 
 Snapshots hold running state, checkpoints, used K/V pages and draft-layer K/V. They add host RAM, not VRAM. Oldest parked entries
 are evicted first. A new conversation that starts at a checkpoint inside a parked one (sub-agents that share a system prompt)
