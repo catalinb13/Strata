@@ -400,9 +400,20 @@ logits, with top_k, top_p, min_p, penalties and a logit_bias. With temperature 0
   or sampled token can then differ from the solo run where two openings are a near tie (measured on M1 Max:
   two slots identical, greedy and sampled; four slots two of four, all answers coherent).
   Turn it on with `"parallel": N` in the run settings (or `--batch N` on the engine); several clients without it still
-  queue, one at a time, as before.
+  queue, one at a time, as before. With `--batch` the engine turns the MTP draft layer off and says so at start
+  (`--batch N: the Mac engine has no per-slot drafter`): there is one drafter and no per-slot K/V ring, so a
+  conversation parked out of a slot could not carry the draft K/V its restore needs. Each slot's rows decode one
+  token per step; `--batch 0` keeps MTP. Measured on M1 Max (64 GB, UD-IQ4_XS, 32,768 context, `--kv fp16`,
+  `--batch 2`, `--conversation-cache-mib 8192`): two 2,662 and 2,664-token conversations sent together were
+  admitted in 218 and 195 ms and decoded in 16 windows of 1.75 rows (70-78 ms a window); a continuing turn reused
+  2,657 of 2,682 tokens from its slot in 1.0-1.2 s, and a conversation parked out of a slot (`parked 2677 tokens
+  from slot 1`, 89 ms) came back to the same slot instead of being read again. `STRATA_BATCH_VERIFY=1` checks a
+  slot's state against the main window's byte for byte at every admission.
   `tools/metal_batch_try.sh` compares solo against batched on your Mac (same prompts; add `--keys
   "temperature=0.7 seed=7"` for the sampled rows): numbers on M1 Max in BATCHING.md's "On Apple Silicon" section.
+  If `"parallel"` was set before this fix, every admission failed with `batch admission failed: metal window: no
+  such batch slot` (the 2026-10-30 merge routed the slot copies through a slot structure the Mac engine never
+  fills) and the engine served one request at a time; that log line no longer appears.
 - **Several requests at once.** `--parallel N` keeps N sequences side by side in the engine, each with its own running state and K/V (0.65 GB each at a 36,864-token context). Measured on an M5 Max with IQ3_S, the MTP draft layer and `--spec 2`, N requests of 150 tokens sent at the same time, tokens a second over all of them: 1 request 85, 2 requests 95 to 102, 3 requests 115, 4 requests 119 to 125. One request alone decodes at 96 to 100; with 2, 3 and 4 at once each decodes at 53 to 61, 41 to 48 and 32 to 40. The engine uses 8.3, 12.0, 14.0 and 16.0 GB for 1 to 4.
 - **Not ported:** the control vector (`--control-vector-scaled`) and the PC tuning (`--calibrate`).
 - **Streaming:** measured at 32 GB only. The model's file must be on the internal SSD; an external disk is untested and likely much slower.

@@ -411,8 +411,6 @@ public:
     }
     // one window of S one-token rows, row t = slot rows[t] at position pos[t]: each runs and commits in its own state
     bool run_slots(const int* rows, int S, const int32_t* tokens, const int64_t* pos, int32_t* out, std::string& err);
-    // slot b's state <-> the main one (the GPU is idle between windows): the running state and the first `upto` cells of K/V
-    bool slot_copy(bool into_slot, int b, int64_t upto, bool kv_only, std::string& err);
     void activate(int set);
     void set_max_t(int t) { max_t_ = std::min(t, MAXT); }
     // ---- the MTP draft layer (mtp.hpp's math on mac-kern's kernels; the MTP GGUF from tools/mtp_pack.py)
@@ -621,11 +619,13 @@ private:
     }
     bool run_rows(const int* rows, int S, const int32_t* tokens, const int64_t* pos, int32_t* out, std::string& err);
     bool finish_rows(int S, const int32_t* tokens, int32_t* out, double t0);
+    // The retired first Mac batch design (see slots_init): --batch's slots are the regions below, and nothing builds a
+    // SeqSet today.  Kept only because alloc_set()/run_rows() still describe it.
     struct SeqSet {
         std::vector<mtl::Buffer> gst, gh0, gh1, kq, vq, ksc, vsc, tail, dead, pooled;
         mtl::Buffer pleHist;
-        // --vision: this slot's own M-RoPE table (int32 [cells][3]), set by slot_copy into the slot from the request that
-        // admitted it: the process's table is rebuilt by every request, the slot's is not.  Not swapped by activate.
+        // --vision: this slot's own M-RoPE table (int32 [cells][3]), set from the request that admitted it: the
+        // process's table is rebuilt by every request, the slot's is not.  Not swapped by activate.
         mtl::Buffer mrope;
         std::vector<float> ple_hist;
         std::vector<float> last_norm;
@@ -3004,7 +3004,7 @@ void Window::swap_state(SeqSet& o) {
 // the buffers of one sequence's running state, shaped like the live ones (real: allocated and zero; else empty placeholders)
 void Window::alloc_set(SeqSet& o, bool real, int idx) {
     const size_t MAXC = (size_t) max_cells_, MB = MAXC / 4 + 2;
-    if (real && mrope_on()) {   // the identity until a request is copied in (slot_copy)
+    if (real && mrope_on()) {   // the identity until a request is copied in
         o.mrope = mropeBig_.bytes > 0 && idx <= g_slot_cap ? view_of(mropeBig_, (size_t) idx * st_mrope_, 12 * (MAXC + 16))
                                                          : cx_->alloc(12 * (MAXC + 16));
         int32_t* m = o.mrope.as<int32_t>();
@@ -3088,73 +3088,17 @@ void Window::activate(int set) {
     active_ = set;
 }
 
+// The serve loop's batch step (one token per active slot).  The slots' state lives in the window's regions
+// (init_slots), so this is the region path's one-token window: run_batch over the rows, then their commit - the
+// verifier's run_slot_rows has nothing left to commit afterwards, exactly as on CUDA.  (The CUDA-shaped
+// sets_/slots_init/run_rows code below is the engine's first Mac batch design and has no caller: between the
+// 2026-10-30 merge and this fix, the serve loop's slot copies were routed through its SeqSet state, which is never
+// built, so every --batch admission failed with "no such batch slot" and served one request at a time.)
 bool Window::run_slots(const int* rows, int S, const int32_t* tokens, const int64_t* pos, int32_t* out, std::string& err) {
-    if (sets_.empty()) { err = "metal window: no batch slots"; return false; }
-    static const bool one_window = !(std::getenv("STRATA_METAL_BATCH_ROWS") && std::string(std::getenv("STRATA_METAL_BATCH_ROWS")) == "0");
-    if (one_window && bigs_ok_) {
-        activate(0);
-        return run_rows(rows, S, tokens, pos, out, err);
-    }
-    bool ok = true;
-    for (int t = 0; t < S && ok; ++t) {
-        if (rows[t] < 0 || rows[t] >= n_slots()) { err = "metal window: a batch row names a slot that does not exist"; ok = false; break; }
-        activate(rows[t] + 1);
-        // a one-token window commits its row in its own step; commit(1) adds the PLE history and the session's token pair,
-        // which read buffers the next window rewrites
-        ok = run(1, tokens + t, pos[t], true, out + t, err) && commit(1, err);
-    }
-    activate(0);
-    return ok;
+    if (!run_batch(S, rows, tokens, pos, out, err)) return false;
+    return commit_batch(S, rows, err);
 }
 
-bool Window::slot_copy(bool into_slot, int b, int64_t upto, bool kv_only, std::string& err) {
-    if (b < 0 || b >= n_slots()) { err = "metal window: no such batch slot"; return false; }
-    activate(0);
-    SeqSet& o = *sets_[(size_t) b + 1];
-    if (pend_fold_ > 0 || o.pend_fold > 0) { err = "metal window: a slot copy with a fold pending"; return false; }
-    if (into_slot && mrope_on() && o.mrope.bytes > 0) {
-        // the slot's positions from the request's table: its cells [0, upto) as they are (the K/V rows hold them rotated
-        // already), then the text after them, one position a cell on from the last one (a prompt never ends in an image,
-        // so its t, h and w are one position)
-        const int64_t n = std::min<int64_t>(upto, max_cells_);
-        if (n < 1) { err = "metal window: a slot copy of an empty conversation with the M-RoPE table set"; return false; }
-        const int32_t* last = g_mrope_host + (n - 1) * 3;
-        if (last[0] != last[1] || last[0] != last[2]) { err = "metal window: a slot copy that ends in an image"; return false; }
-        int32_t* m = o.mrope.as<int32_t>();
-        std::memcpy(m, g_mrope_host, (size_t) n * 12);
-        for (int64_t c = n; c < max_cells_ + 16; ++c) m[c * 3] = m[c * 3 + 1] = m[c * 3 + 2] = (int32_t) (last[0] + (c - n + 1));
-    }
-    const size_t cells = (size_t) std::max<int64_t>(0, std::min<int64_t>(upto, max_cells_));
-    auto cp = [&](const mtl::Buffer& live, const mtl::Buffer& stash, size_t n) {
-        n = std::min({n, live.bytes, stash.bytes});
-        if (into_slot) std::memcpy(stash.ptr, live.ptr, n); else std::memcpy(live.ptr, stash.ptr, n);
-    };
-    const int hs = into_slot ? hp_ : o.hp;   // the committed history parity of the source
-    if (!kv_only) {
-    if (into_slot) o.hp = hp_; else hp_ = o.hp;
-    for (size_t i = 0; i < gst_.size(); ++i) {
-        cp(gst_[i], o.gst[i], gst_[i].bytes);
-        cp(ghist_[hs][i], hs ? o.gh1[i] : o.gh0[i], ghist_[hs][i].bytes);
-    }
-    }
-    const size_t kv_unit = kv_f16_ ? (size_t) G_QKV * G_QD * 2 : (size_t) G_QKV * G_QD;
-    const size_t sc_unit = kv_f16_ ? 0 : (size_t) G_QKV * 8;
-    for (size_t j = 0; j < kq_.size(); ++j) {
-        cp(kq_[j], o.kq[j], cells * kv_unit);
-        cp(vq_[j], o.vq[j], cells * kv_unit);
-        if (sc_unit) cp(ksc_[j], o.ksc[j], cells * sc_unit);
-        if (sc_unit) cp(vsc_[j], o.vsc[j], cells * sc_unit);
-        cp(pooled_[j], o.pooled[j], ((cells + 3) / 4 + 2) * G_ID * 4);
-        if (kv_only) continue;
-        cp(tail_[j], o.tail[j], tail_[j].bytes);
-        cp(dead_[j], o.dead[j], dead_[j].bytes);
-    }
-    if (kv_only) return true;
-    cp(pleHist_, o.pleHist, pleHist_.bytes);
-    if (into_slot) { o.ple_hist = ple_hist_; o.ss->ple_prev[0] = ss_->ple_prev[0]; o.ss->ple_prev[1] = ss_->ple_prev[1]; }
-    else { ple_hist_ = o.ple_hist; ss_->ple_prev[0] = o.ss->ple_prev[0]; ss_->ple_prev[1] = o.ss->ple_prev[1]; }
-    return true;
-}
 
 namespace { strata::core::QsaState* g_draft_state = nullptr; }   // the drafter's QsaState (MtpDrafter::kv_state), bound once the window has the draft layer
 
@@ -5054,10 +4998,6 @@ bool window_run_slots(void* w, const int* rows, int S, const int32_t* tokens, co
     const bool ok = ((Window*) w)->run_slots(rows, S, tokens, pos, out, err);
     ((Window*) w)->prof_add(true, now_ms() - t0);
     return ok;
-}
-bool window_slot_copy_main(bool into_slot, int slot, int64_t upto, bool kv_only, std::string& err) {
-    if (g_the_window == nullptr || !g_the_window->ready()) { err = "metal window: not up"; return false; }
-    return g_the_window->slot_copy(into_slot, slot, upto, kv_only, err);
 }
 bool window_commit(void* w, int n_keep, std::string& err) {
     const double t0 = now_ms();

@@ -741,6 +741,22 @@ combines with `--conversation-cache-mib`: an admitted prompt reads through the m
 slot's region before its rows first run. If the regions do not fit the arena the engine says
 `--batch is off: the window's slot regions do not fit` and serves one request at a time, as before.
 
+With `--batch` the Mac engine runs **without the MTP draft layer** and says so at start. `--batch-mtp` gives each
+slot its own drafter and its own K/V ring on CUDA; the Mac engine has one drafter, so a conversation that decoded
+in a slot has no draft K/V, and parking it beside that one ring would file the wrong conversation's cells under it.
+A slot's rows decode one token per step, and a conversation parked out of a slot then carries exactly what its
+restore needs. `--batch 0` keeps MTP.
+
+Measured on M1 Max with 64 GB (UD-IQ4_XS, 32,768 context, `--kv fp16`, `--batch 2`,
+`--conversation-cache-mib 8192`, `--conversation-cache-min-tokens 2048`, 2026-11-13): two conversations of 2,662
+and 2,664 tokens sent at the same time were admitted to their slots in 218 and 195 ms (`strata batch: slot N takes
+2664 tokens`), decoded in 16 windows of 1.75 rows at 70-78 ms a window, and a continuing turn took 2,657 of 2,682
+tokens back from its own slot (`slot 0 gave back 2657 tokens of this conversation`) in 1.0-1.2 s against 7.5-16.1 s
+to read that prompt again. A conversation parked out of a slot (`parked 2677 tokens from slot 1`, 89-104 ms,
+~306 MB) was admitted back into a slot instead of being read from token 0. `STRATA_BATCH_VERIFY=1` compares each
+slot's state with the main window's byte for byte at every admission; the only difference it reports is the
+indexer's tail row 3, which no checkpoint carries by design.
+
 Measured on an M1 Max with 64 GB (IQ3_XXS, greedy, 128 tokens per prompt, `tools/metal_batch_try.sh`, 2026-10-22
 and 23). Two slots (`2 2 128`): **37.5 tok/s from the first batch token** against 23 and 25 tok/s for the same
 two prompts alone, and every slot's tokens identical to its solo run. Four slots (`4 4 128`): **34.7 tok/s**

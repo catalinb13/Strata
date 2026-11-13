@@ -165,8 +165,6 @@ bool reload_kernels(double* ms, std::string& err);   // hot kernel reload
 // STRATA_BATCH_VERIFY: a restored slot region's bytes vs the main window's (metal/src/engine/window.cpp)
 bool window_check_region(const strata::core::SessionState* ss, int64_t upto, std::string& rep);
 void set_batch_slots(int n);   // metal/src/engine/window.cpp: how many --batch slots the window keeps state for
-// batch slot b <-> the main sequence: the running state (unless kv_only) and the first `upto` cells of K/V
-bool window_slot_copy_main(bool into_slot, int slot, int64_t upto, bool kv_only, std::string& err);
 std::string draft_vocab_default();   // metal/src/engine/window.cpp: the packaged default draft subset (data/draft_vocab.bin)
 bool draft_vocab_whole_head();       // STRATA_METAL_DRAFT_VOCAB=full
 }
@@ -7101,6 +7099,19 @@ int main(int argc, char** argv) {
             }
         }
     }
+#if defined(STRATA_GPU_METAL)
+    // The Mac engine has no per-slot drafter: --batch-mtp needs one MTP K/V ring per slot (a MtpDrafter each on CUDA),
+    // and a batch window runs one token per row with no draft anyway.  So a conversation that decoded in a slot has no
+    // draft K/V, and parking it beside the single drafter would file whichever conversation that ring last ran under
+    // this one - the restore would then read those cells back as this conversation's.  With --batch the Mac engine runs
+    // without the draft layer, and says so; a parked slot conversation then carries exactly what its restore needs.
+    if (o.batch >= 2 && !o.mtp.empty()) {
+        std::fprintf(stderr, "strata generate: --batch %d: the Mac engine has no per-slot drafter, so the MTP draft layer "
+                             "is off for this run: a slot's rows decode one token per step, and a conversation parked out "
+                             "of a slot carries no draft K/V to restore.  --batch 0 keeps MTP.\n", o.batch);
+        o.mtp.clear();
+    }
+#endif
     // --batch-groups auto: the pipeline needs one group per GPU stage to keep every card busy (4 x R9700, 8 clients:
     // 90 tok/s in one group, 136 in 2, 166 in 4).  The most groups, at most one per stage, that divide the slots.
     // The default (0.1.41: a layer split with --batch pipelines one group per stage; --batch-groups 1 opts out) gives
@@ -14559,8 +14570,15 @@ int main(int argc, char** argv) {
         // round trip through host memory, which costs ~40-90 ms per admission on a 4-card split); each device is
         // synchronized once before and once after.  Opt-in: STRATA_SLOT_COPY_DIRECT=1 (default: the host path).
         static const bool slot_copy_direct = [] {
+#if defined(STRATA_GPU_METAL)
+            // A direct copy reads the sessions' own device buffers.  The Mac engine has none: its running state lives in
+            // the window's K/V cells and, per slot, in the window's regions, so every slot copy goes through the
+            // checkpoint/K-V image, which is region-aware (window_checkpoint_*, window_kv_pools).
+            return false;
+#else
             const char* v = std::getenv("STRATA_SLOT_COPY_DIRECT");
             return v != nullptr && v[0] != '\0' && v[0] != '0';
+#endif
         }();
         auto direct_slot_copy = [&](bool into_slot, int b, const std::vector<int32_t>& ids, std::string& e) -> bool {
             const int64_t upto = (int64_t) ids.size();
@@ -14595,10 +14613,6 @@ int main(int argc, char** argv) {
         };
         auto copy_to_slot = [&](int b, const std::vector<int32_t>& ids, std::string& e) -> bool {
             const int64_t upto = (int64_t) ids.size();
-#if defined(STRATA_GPU_METAL)
-            // the running state and the K/V of the Metal window, not the session's device buffers
-            return strata::metal_engine::window_slot_copy_main(true, b, upto, false, e);
-#endif
             if (slot_copy_direct) {
                 if (!direct_slot_copy(true, b, ids, e)) return false;
             } else
@@ -14671,10 +14685,6 @@ int main(int argc, char** argv) {
             conversations.take_reuse();
             const int64_t upto = at != nullptr ? (int64_t) at->ids.size() : (int64_t) bs[(size_t) b].ids.size();
             if (at != nullptr && at->stage_parts.size() != stages.size()) { e = "a checkpoint without its stage parts"; return false; }
-#if defined(STRATA_GPU_METAL)
-            if (!strata::metal_engine::window_slot_copy_main(false, b, upto, at != nullptr, e)) return false;
-            return at == nullptr || strata::core::conversation_checkpoint_restore(*at, ss, g, e);   // (the checkpoint's running state)
-#endif
             if (slot_copy_direct && at == nullptr) {
                 if (!direct_slot_copy(false, b, bs[(size_t) b].ids, e)) return false;
             } else
@@ -14703,6 +14713,10 @@ int main(int argc, char** argv) {
                 }
                 if (cudaDeviceSynchronize() != cudaSuccess) { e = "batch slot restore: device sync failed"; return false; }
             }
+#if !defined(STRATA_GPU_METAL)
+            // The slot drafters (--batch-mtp, STRATA_BATCH_DF2) exist only on CUDA: the Mac engine keeps one drafter and
+            // no per-slot ring, so a slot's conversation has no draft K/V to bring back (see the --batch note where the
+            // Mac engine turns the draft layer off).
             if (batch_df2) {
 #if defined(STRATA_HAVE_DFLASH2)
                 if (!df2.copy_state_from(*slot_df2[(size_t) b], e)) return false;   // a returning solo request goes on from the slot's ring
@@ -14720,6 +14734,7 @@ int main(int argc, char** argv) {
                     return false;
                 mtp.set_prompt_len(upto);
             }
+#endif
             return true;
         };
         auto stage_verifier = [&](int k) -> strata::core::Verifier& { return k == 0 ? ver : stages[(size_t) k - 1]->ver; };
