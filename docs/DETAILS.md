@@ -172,6 +172,17 @@ VRAM. RTX 3090, the Coder at 198K context: 99 instead of 85 tokens/s output, the
 slower. It streams its KV cache like the other formats (`--kv-resident N`): on an RTX 2060 SUPER 8 GB at 128K with
 20,480 resident cells, +780 expert slots over resident K8V4, and it scores better than 4-bit KV on long documents.
 
+**Unquantized (fp16) KV cache on the Mac (optional, `--kv fp16`):** the Mac engine can also keep the K/V as raw
+halves with no scales, the checkpoint's exact values. It is opt-in: without the flag the Mac stores 8-bit, exactly as
+before. On an M1 Max (64 GB) with the Qwen3.8-Flash-Next UD-IQ4_XS pack of this release, arena 32 GB, 204800
+context, a 357-token prompt and 192 new tokens, the settings of `strata launch`: 22.53 against 22.79 tokens/s decode
+(the same, within run-to-run noise), prompts 24.4 against 26.4 tokens/s (7% slower), and 2.5 GB more resident (53.9
+against 51.4 GB) because a half is two bytes where a code is one. So it buys exactness, not speed. Its answers score
+the same as 8-bit on the token-forcing check (`tools/force_check.py`: 12.76% of forced tokens go to a different
+argmax, against 12.02% and 12.26% for two 8-bit arms — inside their own spread, and it raised no large-margin
+event). At a 4K prompt the two are level again (60.3 against 60.9 ms a decode window). Prefer 8-bit unless a
+conversation needs the cache's exact values and the memory has room.
+
 **Reproducible greedy output (0.1.30, opt-in, `STRATA_IQ_MT_MIN=1`):** with the IQ models, the CPU computes an
 expert for one token with ggml's dot product and for several tokens with Strata's multi-token kernels, which round
 slightly differently. How many tokens share an expert depends on the drafts in a verify window, so the same prompt

@@ -384,6 +384,13 @@ logits, with top_k, top_p, min_p, penalties and a logit_bias. With temperature 0
   and starts the same program on the CPU. With Q2_0 streaming from the SSD on that M4, the STRATA 42 test picture (red circle, blue square,
   green triangle, the text "STRATA 42") was described correctly with both readers. Checked on one Mac only; the M5 Max is untested for pictures.
 - **Context:** measured up to 32K (needles, KL). Setup recommends 32K below 96 GB and 64K from 96 GB. Up to the model's 262K can be set, but it is not measured.
+- **The KV cache's format (`--kv`):** the Mac stores 8-bit codes with one fp16 scale per 64 values, which is the default and what every
+  measurement above used. `--kv fp16` keeps the keys and values as raw halves instead, with no quantization. It is opt-in: without the
+  flag nothing changes. On an M1 Max (64 GB) with the UD-IQ4_XS pack, arena 32 GB and 204800 context, a 357-token prompt and 192 new
+  tokens: 22.53 against 22.79 tokens/s decode (the same, within noise), prompts 24.4 against 26.4 (7% slower), and 2.5 GB more resident
+  (53.9 against 51.4 GB) because a half is two bytes where a code is one. It buys exactness, not speed; the token-forcing check scores it
+  the same as 8-bit (12.76% against 12.02% and 12.26% for two 8-bit arms). `--kv q4_0` and `--kv k8v4` have no Mac kernel: the Mac runs
+  its 8-bit path.
 - **Requests together (`--parallel`, batch slots): experimental, opt-in.** The Mac engine runs the batch slots in a batch window of its own: one dispatch batch, up to 8 rows, and each row reads and writes its own conversation's
   parked state (its own region of the arena). The per-slot state stays byte-exact (checked byte for byte at every
   admission), but a batched row does not byte-replay the solo window: kernels that batch rows in one dispatch

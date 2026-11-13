@@ -106,7 +106,10 @@ bool valid(const QsaState& st, const Layout& l, int64_t upto, std::string& error
     // (`sizes[i] > cap[i]`).  A state the window does not hold still refuses, exactly as before.
     void* wp[5];
     size_t wc[5];
-    const bool via_window = st.kv_int8 && !st.kv_q4 && !st.kv_hybrid && st.kv_mode == 0 &&
+    // The window holds BOTH layouts its kernels implement — int8 codes + scales, and direct fp16 halves (--kv fp16,
+    // qsa_prep_fp16/qsa_attn_fp16/qsa_flash_fp16).  q4 and hybrid are the ones it does not.  window_cells shuffles
+    // by `unit`, which the caller derives from the image size, so it is layout-agnostic.
+    const bool via_window = st.kv_mode == 0 && !st.kv_q4 && !st.kv_hybrid &&
                             strata::metal_engine::window_kv_pools(st, wp, wc);
 #else
     const bool via_window = false;
@@ -154,7 +157,8 @@ bool valid(const QsaState& st, const Layout& l, int64_t upto, std::string& error
 // not hold (the drafter's ring under --mtp, a streaming mode, a K/V format its kernels do not implement) parks
 // nothing: these copies return false and serve reports the reason instead of touching a dead allocation.
 bool window_pools(const QsaState& st, void* out[5], size_t cap[5]) {
-    return st.kv_int8 && !st.kv_q4 && !st.kv_hybrid && st.kv_mode == 0 &&
+    // int8 and fp16 are both window-resident (only q4 and hybrid are not); the repack below is layout-agnostic.
+    return st.kv_mode == 0 && !st.kv_q4 && !st.kv_hybrid &&
            strata::metal_engine::window_kv_pools(st, out, cap);
 }
 
