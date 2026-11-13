@@ -177,6 +177,21 @@ group("df2x",
       ("DF2c", A(args=["--draft", "dflash2", "--draft-model", DF2, "--draft-fallback", "none", "--spec", "4", "--draft-conf", "0.7"])),
       )
 
+group("f16b",
+      ("BASE", A()),
+      ("F16", A(env={"STRATA_METAL_F16": "1"})),
+      ("BASE2", A()),
+      ("F16b", A(env={"STRATA_METAL_F16": "1"})),
+      ("F16_s3", A(env={"STRATA_METAL_F16": "1"}, args=["--spec", "3"])),
+      )
+
+group("prefill",
+      ("base16k", A(tokens=f"{ROOT}/gap/tokens/t16384.txt", max_new=32)),
+      ("pipe1", A(tokens=f"{ROOT}/gap/tokens/t16384.txt", max_new=32, args=["--prefill-pipe", "1"])),
+      ("base16kb", A(tokens=f"{ROOT}/gap/tokens/t16384.txt", max_new=32)),
+      ("pipe1b", A(tokens=f"{ROOT}/gap/tokens/t16384.txt", max_new=32, args=["--prefill-pipe", "1"])),
+      )
+
 # ---------------------------------------------------------------- memory shape
 group("mem",
       ("BASE", A()),
