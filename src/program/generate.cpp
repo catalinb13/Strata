@@ -164,6 +164,8 @@ void set_model_shard(const char* shard1);   // metal/src/engine/window.cpp
 bool reload_kernels(double* ms, std::string& err);   // hot kernel reload
 // STRATA_BATCH_VERIFY: a restored slot region's bytes vs the main window's (metal/src/engine/window.cpp)
 bool window_check_region(const strata::core::SessionState* ss, int64_t upto, std::string& rep);
+// --vision: the conversation's M-RoPE positions, main window <-> slot b (a batch row rotates by its own slot's table)
+bool window_mrope_copy(int slot, bool into_slot, std::string& err);
 void set_batch_slots(int n);   // metal/src/engine/window.cpp: how many --batch slots the window keeps state for
 std::string draft_vocab_default();   // metal/src/engine/window.cpp: the packaged default draft subset (data/draft_vocab.bin)
 bool draft_vocab_whole_head();       // STRATA_METAL_DRAFT_VOCAB=full
@@ -14675,6 +14677,11 @@ int main(int argc, char** argv) {
                 slot_mtp[(size_t) b]->set_prompt_len(upto);
             }
 #endif
+#if defined(STRATA_GPU_METAL)
+            // --vision: the conversation's M-RoPE positions travel with its state (#4908).  The row reads its slot's
+            // own table, so another request's positions cannot rotate it.
+            if (!strata::metal_engine::window_mrope_copy(b, true, e)) return false;
+#endif
             return true;
         };
         // slot b's sessions -> the main ones (the reverse of copy_to_slot): a request that continues the
@@ -14734,6 +14741,11 @@ int main(int argc, char** argv) {
                     return false;
                 mtp.set_prompt_len(upto);
             }
+#endif
+#if defined(STRATA_GPU_METAL)
+            // ... and back: the slot's positions become the main window's and the process's, so the solo window that
+            // continues this conversation rotates by the same table (#4908).
+            if (!strata::metal_engine::window_mrope_copy(b, false, e)) return false;
 #endif
             return true;
         };

@@ -765,6 +765,13 @@ were clean. The batch encode now picks `qsa_prep_fp16`/`qsa_attn_fp16` for an fp
 buffers, the fp16 K/V store saturates, and `qsa_attn_fp16` drops a non-finite cache term. The same 18-round loop then
 ran 870 windows with 78 admissions, 115 parks and conversations out to 3,422 tokens and fired none.
 
+With `--vision`, a batch row rotates by its own slot's M-RoPE table, not the process's: each region keeps one
+(393 KB at a 32K context, 3.1 MB at 262K) and the positions travel with the conversation through admission and back.
+Before that, every row read one table and only the row synced last kept its positions, so a picture's text (its
+positions are not the identity after the image) could rotate as another request's. Not confirmed end to end: on the
+Mac this was written on, the same greedy request alone gives different text later in the session, so the comparison
+of an alone run against a batched one has no reference here (issue #4908's own hardware is the place to check).
+
 Measured on an M1 Max with 64 GB (IQ3_XXS, greedy, 128 tokens per prompt, `tools/metal_batch_try.sh`, 2026-10-22
 and 23). Two slots (`2 2 128`): **37.5 tok/s from the first batch token** against 23 and 25 tok/s for the same
 two prompts alone, and every slot's tokens identical to its solo run. Four slots (`4 4 128`): **34.7 tok/s**

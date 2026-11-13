@@ -390,6 +390,9 @@ public:
     bool commit_batch(int S, const int* rows, std::string& err);
     // diagnostic (STRATA_BATCH_VERIFY): a restored slot region's bytes vs the main window's (the copy's source)
     bool check_region(const strata::core::SessionState* ss, int64_t upto, std::string& rep);
+    // --vision: the conversation's M-RoPE positions, main window <-> slot b.  A batch row rotates by its own slot's
+    // table, and the admitting request's table is the authoritative copy of what its positions are (#4908).
+    bool mrope_copy(int b, bool into_slot, std::string& err);
     // park/restore: the live K/V cells of the QSA layer that owns this session state, with each buffer's size
     bool kv_pools(const strata::core::QsaState& st, void* out[5], size_t cap[5]);
     // Conversation parking reads the K/V from the session's QsaStates.  On Metal the K/V lives only in this window's buffers
@@ -606,6 +609,7 @@ private:
     // slot's table (rinfo_ row word 3: its offset in ints); allocated with the slots, only when the table is set
     mtl::Buffer mropeBig_;
     size_t st_mrope_ = 0;
+    bool mrope_from_slot_ = false;   // the window's M-RoPE table came from a slot (a continued conversation), not a read
     bool rows_ = false;       // the window being built / run holds one token of each of rows_n_ DIFFERENT sequences (batch slots)
     int rows_n_ = 0;
     strata::core::SessionState* rows_ss_[MAXT] = {};
@@ -688,6 +692,11 @@ private:
         strata::core::SessionState* ss = nullptr;   // the slot's session (never the main one)
         std::vector<mtl::Buffer> gst, ghist[2], kq, vq, ksc, vsc, tail, dead, pooled;
         mtl::Buffer pleHist;
+        // --vision: this slot's own M-RoPE positions (int32 [cell][3]), filled from the admitting request's table, so a
+        // batch row rotates by its own conversation's positions.  One shared table is what #4908 reported: the row
+        // read whichever request uploaded last, and a picture's text sits at fewer positions than it has cells, so it
+        // rotated as if it came later.  Empty when the engine runs without --vision.
+        mtl::Buffer mrope;
         int hp = 0;                     // the region's history parity: it turns only when its own row steps
         int32_t last_tokens[MAXT] = {};  // the row's input tokens (commit_batch advances the slot's ple_prev)
     };
@@ -838,6 +847,12 @@ private:
     bool mrope_on() const { return g_mrope_host != nullptr; }
     void mrope_sync(int64_t c0, int64_t n) {
         if (!mrope_on()) return;
+        // A conversation that came back from a slot carries its own positions in mrope_ (mrope_copy, which restores
+        // them), so its decode cells must not be re-read from the process's table: that table belongs to whichever
+        // request is being READ right now, and a picture request's decode positions are not the identity.  A prompt
+        // chunk (n > 1) is being read, so it re-establishes the process's table as the source.
+        if (n > 1) mrope_from_slot_ = false;
+        else if (mrope_from_slot_) return;
         const int64_t a = std::max<int64_t>(0, c0 & ~(int64_t) 3), b = std::min<int64_t>(max_cells_, c0 + n);
         // a batch slot's own window (activate, the slot-by-slot path): the slot's table, not the process's
         const SeqSet* live = active_ != 0 && (size_t) active_ < sets_.size() ? sets_[(size_t) active_].get() : nullptr;
@@ -1794,7 +1809,7 @@ void Window::layer_batch(std::vector<mtl::Dispatch>& ds, int l, int S, const int
             d.args.push_back(mtl::Arg::B(rg.dead[(size_t) qi]));
             d.args.push_back(mtl::Arg::B(rg.pooled[(size_t) qi]));
             d.args.push_back(mtl::Arg::V(a));
-            d.args.push_back(mtl::Arg::B(mrope_));
+            d.args.push_back(mtl::Arg::B(rg.mrope.bytes > 0 ? rg.mrope : mrope_));   // the row's own positions (#4908)
             d.grid[0] = 33;
             d.grid[1] = 1;
             d.tg[0] = 256;
@@ -1896,9 +1911,43 @@ bool Window::init_slots(int S, strata::core::SessionState* const* slots, std::st
             }
         }
         rg.pleHist = A2(4 * 9 * 10240);
+        if (mrope_on()) {
+            rg.mrope = A2(12 * (size_t) (max_cells_ + 16));
+            int32_t* m = rg.mrope.as<int32_t>();   // the identity, as init() gives the main window's table
+            for (int64_t c = 0; c < max_cells_ + 16; ++c) m[c * 3] = m[c * 3 + 1] = m[c * 3 + 2] = (int32_t) c;
+        }
         regs_.push_back(std::move(rg));
     }
-    std::fprintf(stderr, "strata metal: %d batch slot region(s): %.2f GB in %.1f ms\n", S, bytes / 1e9, now_ms() - t0);
+    std::fprintf(stderr, "strata metal: %d batch slot region(s): %.2f GB in %.1f ms%s\n", S, bytes / 1e9, now_ms() - t0,
+                 mrope_on() ? " (each with its own M-RoPE table: a picture's positions cannot be another row's)" : "");
+    return true;
+}
+
+bool Window::mrope_copy(int b, bool into_slot, std::string& err) {
+    if (!mrope_on()) return true;                       // no table, nothing to carry (and the rows bind mrope_)
+    if (b < 0 || b >= (int) regs_.size()) { err = "metal window: no such batch slot"; return false; }
+    mtl::Buffer& t = regs_[(size_t) b].mrope;
+    if (t.bytes == 0) { err = "metal window: a slot without an M-RoPE table"; return false; }
+    // into the slot: the admitting request builds every cell it can reach (the image positions, then the text after
+    // them), and that table is the process's while the request is being admitted.
+    // out of it: the slot's becomes the main window's AND the process's, so the solo window that continues this
+    // conversation syncs the same positions - mrope_sync reads the process's table.
+    const size_t n = std::min(mrope_.bytes, t.bytes);
+    if (into_slot) {
+        std::memcpy(t.ptr, g_mrope_host, n);
+        mrope_from_slot_ = false;
+    } else {
+        // Only the window's own table: writing the process's would be writing it for whichever request is being READ
+        // at that moment - a picture request's prompt read, if it is second, would then rotate its image cells as
+        // text.  The decode that continues this conversation reads mrope_, and mrope_sync leaves it alone.
+        std::memcpy(mrope_.ptr, t.ptr, n);
+        mrope_from_slot_ = true;
+    }
+    if (std::getenv("STRATA_PARK_DEBUG") != nullptr) {
+        const int32_t* c = t.as<int32_t>();
+        std::fprintf(stderr, "strata metal mrope: slot %d %s: cell 0 (%d,%d,%d) cell 8 (%d,%d,%d) cell 96 (%d,%d,%d)\n",
+                     b, into_slot ? "in" : "out", c[0], c[1], c[2], c[24], c[25], c[26], c[288], c[289], c[290]);
+    }
     return true;
 }
 
@@ -2003,7 +2052,10 @@ bool Window::run_batch(int S, const int* rows, const int32_t* tokens, const int6
     key = key * 256 + selmask;
     key = key * 256 + hpmask;
     key = key * 2 + (mrope_on() ? 1 : 0);
-    for (int t = 0; t < S; ++t) mrope_sync(pos[t], 1);
+    // --vision: no mrope_sync here.  Each row reads its own slot's table, which admission filled from the admitting
+    // request (mrope_copy); copying the process's table into one shared one per row is what let a text request's
+    // identity overwrite a picture request's positions (#4908).  A decode cell is not the identity after an image, so
+    // it cannot be rebuilt from the cell index either.
     // the cached window binds the regions, rows and grids (all in the key); only the positions change
     auto patch = [&](Cached& c) {
         for (const auto& [i, kind] : c.qsa) {
@@ -5101,6 +5153,10 @@ bool Window::check_region(const strata::core::SessionState* ss, int64_t upto, st
                   (long long) upto, hp_, rg.hp, pend_fold_, bad ? "MISMATCH" : "all match");
     rep = hdr + rep;
     return !bad;
+}
+bool window_mrope_copy(int slot, bool into_slot, std::string& err) {
+    if (g_the_window == nullptr || !g_the_window->ready()) { err = "metal window: not up"; return false; }
+    return g_the_window->mrope_copy(slot, into_slot, err);
 }
 bool window_check_region(const strata::core::SessionState* ss, int64_t upto, std::string& rep) {
     if (g_the_window == nullptr || !g_the_window->ready()) { rep = "metal window: not up"; return false; }

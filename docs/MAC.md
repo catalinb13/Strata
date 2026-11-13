@@ -420,6 +420,15 @@ logits, with top_k, top_p, min_p, penalties and a logit_bias. With temperature 0
   the fp16 K/V store also saturates and `qsa_attn_fp16` drops a non-finite cache term, the way the expert path does.
   Verified with the same run that fired: 870 batch windows, 78 slot admissions, 115 parks and conversations out to
   3,422 tokens afterwards gave no fire (before: five in 680 windows, all at 2,900-3,250 tokens).
+  With `--vision`, each slot now keeps its own M-RoPE table (int32 [cell][3]: 393 KB a slot at a 32K context,
+  3.1 MB at 262K, allocated only when vision is on) and the window's positions travel with its state through
+  admission and back, because a batch row that read the process's one table rotated by whichever request was read
+  last - and a picture's text sits at fewer M-RoPE positions than it has cells, so it was the case that showed
+  (#4908). Whether that is the whole of #4908 is not settled: it cannot be measured on the box this was written on,
+  where the same greedy request alone gives different text later in the session (the expert tier's copies round
+  differently: "the GPU computes the experts in the cache; it rounds differently from the CPU ... depends on when its
+  copy lands", docs/DETAILS.md), and `--batch` also serves without the draft layer, so an alone run and a batched one
+  differ by decoding scheme before positions are in question.
   `tools/metal_batch_try.sh` compares solo against batched on your Mac (same prompts; add `--keys
   "temperature=0.7 seed=7"` for the sampled rows): numbers on M1 Max in BATCHING.md's "On Apple Silicon" section.
   If `"parallel"` was set before this fix, every admission failed with `batch admission failed: metal window: no
