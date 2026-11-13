@@ -109,6 +109,10 @@ Two corrections to the old table, both material:
   what turned into the 3.4 ms of hyper-connection reads and the 1.9 ms router that the old split
   did not name.
 
+At a 32K-token prompt the same window is **42.33 ms** (+3.4%): qsa/attention grows 1.63 → 2.28 ms
+(4.0% → 5.4% of the window) and the class order does not change. Depth is not where the time goes;
+the 111K case (§7 Q5) is still unmeasured but cannot be a different story by more than ~4 ms.
+
 The whole window moves **7.1 GB in 40.95 ms = 174 GB/s**, 49% of the 358 GB/s DRAM ceiling. Per class
 the gap is: dense Q6_K ~200 vs 358, hyper-connection reads ~114 vs 358, experts ~300 vs 358. Those are
 the three numbers that bound any further kernel work.
