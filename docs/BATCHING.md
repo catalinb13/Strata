@@ -756,6 +756,14 @@ to read that prompt again. A conversation parked out of a slot (`parked 2677 tok
 ~306 MB) was admitted back into a slot instead of being read from token 0. `STRATA_BATCH_VERIFY=1` compares each
 slot's state with the main window's byte for byte at every admission; the only difference it reports is the
 indexer's tail row 3, which no checkpoint carries by design.
+A defect this path had, found and fixed on 2026-11-13: with `--kv fp16` the batch window dispatched the int8 QSA
+kernels while a slot's region is laid out for the fp16 one, so the int8 prep wrote a scale plane (16 bytes a cell,
+about 512 KB a layer a slot) past the region's 16-byte placeholder and into the arena. The address advances with the
+token's cell, so it reached sensitive memory at about 3,000 tokens and a row went non-finite - five times in one
+680-window run of three conversations, each fire dropping the parked conversations with it. Solo and int8 `--batch`
+were clean. The batch encode now picks `qsa_prep_fp16`/`qsa_attn_fp16` for an fp16 cache and omits the scale
+buffers, the fp16 K/V store saturates, and `qsa_attn_fp16` drops a non-finite cache term. The same 18-round loop then
+ran 870 windows with 78 admissions, 115 parks and conversations out to 3,422 tokens and fired none.
 
 Measured on an M1 Max with 64 GB (IQ3_XXS, greedy, 128 tokens per prompt, `tools/metal_batch_try.sh`, 2026-10-22
 and 23). Two slots (`2 2 128`): **37.5 tok/s from the first batch token** against 23 and 25 tok/s for the same

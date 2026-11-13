@@ -409,6 +409,17 @@ logits, with top_k, top_p, min_p, penalties and a logit_bias. With temperature 0
   2,657 of 2,682 tokens from its slot in 1.0-1.2 s, and a conversation parked out of a slot (`parked 2677 tokens
   from slot 1`, 89 ms) came back to the same slot instead of being read again. `STRATA_BATCH_VERIFY=1` checks a
   slot's state against the main window's byte for byte at every admission.
+  A defect this path had, found and fixed on 2026-11-13: with `--kv fp16` the batch window dispatched the **int8**
+  QSA kernels while the slot regions are laid out for the fp16 one (halves of K/V, and a 16-byte placeholder where
+  the per-64 scales would go). The int8 prep then wrote a whole scale plane - `(cell * 2 + head) * 4` halves, 16
+  bytes a cell, about 512 KB a layer a slot - past that placeholder into the arena, and its address advances 16
+  bytes a token: it swept into sensitive memory at about 3,000 tokens and a row went non-finite (`non-finite logits
+  (#879) in slot N at position ~3000`, which also drops the parked conversations). Solo dispatched the fp16 kernels
+  and never saw it, and `--batch` with int8 K/V allocates the plane it writes and never saw it either. The batch
+  encode now selects `qsa_prep_fp16`/`qsa_attn_fp16` for an fp16 cache and does not pass it the scale buffers;
+  the fp16 K/V store also saturates and `qsa_attn_fp16` drops a non-finite cache term, the way the expert path does.
+  Verified with the same run that fired: 870 batch windows, 78 slot admissions, 115 parks and conversations out to
+  3,422 tokens afterwards gave no fire (before: five in 680 windows, all at 2,900-3,250 tokens).
   `tools/metal_batch_try.sh` compares solo against batched on your Mac (same prompts; add `--keys
   "temperature=0.7 seed=7"` for the sampled rows): numbers on M1 Max in BATCHING.md's "On Apple Silicon" section.
   If `"parallel"` was set before this fix, every admission failed with `batch admission failed: metal window: no

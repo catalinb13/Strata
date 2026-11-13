@@ -871,9 +871,11 @@ private:
     mtl::Buffer dout_, dprob_, posv_, dmap_;
     // debug capture (STRATA_BATCH_VERIFY): R's row sums after every fold, so a batch row's step
     // trajectory can be diffed against the same solo step; the first fold that parts is the kernel
-    void cap_bo(std::vector<mtl::Dispatch>& ds, int ntok);
-    void cap_buf(std::vector<mtl::Dispatch>& ds, const mtl::Buffer& b, size_t off, int roww, int ntok);
-    void cap_fold(std::vector<mtl::Dispatch>& ds, int ntok);
+    void cap_bo(std::vector<mtl::Dispatch>& ds, int ntok, const char* tag = nullptr);
+    void cap_buf(std::vector<mtl::Dispatch>& ds, const mtl::Buffer& b, size_t off, int roww, int ntok,
+                 const char* tag = nullptr);
+    void cap_fold(std::vector<mtl::Dispatch>& ds, int ntok, const char* tag = nullptr);
+    std::vector<std::string> cap_tags_;   // what each capture reads, printed with the trajectory
     mtl::Buffer dsb_;
     int cap_ctr_ = 0;
     bool cap_on_ = false;
@@ -1272,7 +1274,7 @@ void Window::xprep(std::vector<mtl::Dispatch>& ds, const mtl::Buffer& x, const A
 // the fold-sum capture (STRATA_BATCH_VERIFY): R's per-row sums after every gr_norm, into dsb_[ctr * MAXT + t].
 // Debug only: each capture rides a barrier (the preceding push left nb_ false) so it reads R after the fold
 // that wrote it; the extra barriers cost nothing when the environment variable is unset (cap_on_ is false).
-void Window::cap_fold(std::vector<mtl::Dispatch>& ds, int ntok) {
+void Window::cap_fold(std::vector<mtl::Dispatch>& ds, int ntok, const char* tag) {
     if (!cap_on_) return;
     GrArgs a{N, HC, LR, (uint32_t) ntok, 0u, eps_};
     mtl::Dispatch d;
@@ -1282,10 +1284,11 @@ void Window::cap_fold(std::vector<mtl::Dispatch>& ds, int ntok) {
     d.tg[0] = 256;
     push(ds, d);
     ++cap_ctr_;
+    cap_tags_.push_back(tag ? tag : "fold");
 }
 
 // the same, on the mixer output `bo_` (grid row width N): tells a bad GDN/attention output apart from a bad fold gate
-void Window::cap_bo(std::vector<mtl::Dispatch>& ds, int ntok) {
+void Window::cap_bo(std::vector<mtl::Dispatch>& ds, int ntok, const char* tag) {
     if (!cap_on_) return;
     GrArgs a{N, 1u, 0u, (uint32_t) ntok, 0u, eps_};
     mtl::Dispatch d;
@@ -1295,10 +1298,12 @@ void Window::cap_bo(std::vector<mtl::Dispatch>& ds, int ntok) {
     d.tg[0] = 256;
     push(ds, d);
     ++cap_ctr_;
+    cap_tags_.push_back(tag ? tag : "bo");
 }
 
 // the same, on `roww`-wide rows of `b` starting at byte offset `off`: the stage captures inside the GDN chain
-void Window::cap_buf(std::vector<mtl::Dispatch>& ds, const mtl::Buffer& b, size_t off, int roww, int ntok) {
+void Window::cap_buf(std::vector<mtl::Dispatch>& ds, const mtl::Buffer& b, size_t off, int roww, int ntok,
+                     const char* tag) {
     if (!cap_on_) return;
     GrArgs a{(uint32_t) roww, 1u, 0u, (uint32_t) ntok, 0u, eps_};
     mtl::Dispatch d;
@@ -1308,6 +1313,7 @@ void Window::cap_buf(std::vector<mtl::Dispatch>& ds, const mtl::Buffer& b, size_
     d.tg[0] = 256;
     push(ds, d);
     ++cap_ctr_;
+    cap_tags_.push_back(tag ? tag : "buf");
 }
 
 // the hyper-connection read (gr.metal, 3 dispatches): the previous sublayer's write folded in when `apply`
@@ -1719,10 +1725,10 @@ void Window::layer_batch(std::vector<mtl::Dispatch>& ds, int l, int S, const int
         gemv(ds, T(b + "ssm_alpha.weight"), XA_, alL_, 48, S, o_ab);
         nb_ = true;
         gemv(ds, T(b + "ssm_beta.weight"), XA_, beL_, 48, S, o_ab);
-        cap_buf(ds, qkvL_, o_qkv, 10240, S);   // the four projections and the conv output, before the recurrence
-        cap_buf(ds, zL_, o_z, 6144, S);
-        cap_buf(ds, alL_, o_ab, 48, S);
-        cap_buf(ds, beL_, o_ab, 48, S);
+        cap_buf(ds, qkvL_, o_qkv, 10240, S, (b + "qkv").c_str());   // the four projections and the conv output, before the recurrence
+        cap_buf(ds, zL_, o_z, 6144, S, (b + "z").c_str());
+        cap_buf(ds, alL_, o_ab, 48, S, (b + "alpha").c_str());
+        cap_buf(ds, beL_, o_ab, 48, S, (b + "beta").c_str());
         // the recurrence: one solo T=1 step per row (same pipeline "gdn_step#1", same grid 48); the first
         // waits behind a barrier for the four GEMVs, the rest run beside it (their rows never meet).
         for (int t = 0; t < S; ++t) {
@@ -1748,9 +1754,9 @@ void Window::layer_batch(std::vector<mtl::Dispatch>& ds, int l, int S, const int
             push(ds, d);
         }
         if (!fuse_) xprep(ds, yg_, XY_, 6144);   // the whole row range: rows the batch did not write are stale,
-        cap_buf(ds, XY_.b, 0, 6144, S);
+        cap_buf(ds, XY_.b, 0, 6144, S, (b + "XY").c_str());
         gemv(ds, T(b + "ssm_out.weight"), XY_, bo_, N, S);   // and nothing reads them before the next write
-        cap_bo(ds, S);   // the GDN output the fold at this layer's ffn will read
+        cap_bo(ds, S, (b + "bo").c_str());   // the GDN output the fold at this layer's ffn will read
     } else {
         const int qi = l / 4;
         gemv(ds, T(b + "attn_q.weight"), XA_, qfull_, 12288, S);
@@ -1767,7 +1773,11 @@ void Window::layer_batch(std::vector<mtl::Dispatch>& ds, int l, int S, const int
             const bool sel = !(fuse_ && pos[t] + 1 <= 2051);
             QsaArgs a{(uint32_t) pos[t], 0, (uint32_t) max_cells_, 1u, eps_};
             mtl::Dispatch d;
-            d.p = P(lqsa_, "qsa_prep", qsa_c(), qsa_k());
+            // --kv fp16: the region's K/V are halves and its scale planes are a 16-byte placeholder, so the fp16
+            // kernel pair is the one that matches them (it takes no ksc/vsc at all).  Dispatching the int8 pair here
+            // - as this path did - wrote a whole scale plane past that placeholder, into the arena (#879 in batch).
+            const char* prep = kv_f16_ ? "qsa_prep_fp16" : "qsa_prep";
+            d.p = P(lqsa_, prep, qsa_c(), kv_f16_ ? std::string(prep) + (mrope_on() ? "#mrope" : "") : qsa_k());
             d.args = {mtl::Arg::B(qfull_, (size_t) t * 12288 * 4), mtl::Arg::B(kcur_, (size_t) t * 512 * 4),
                       mtl::Arg::B(vcur_, (size_t) t * 512 * 4), mtl::Arg::B(iqr_, (size_t) t * 512 * 4),
                       mtl::Arg::B(ikr_, (size_t) t * 128 * 4),
@@ -1777,10 +1787,14 @@ void Window::layer_batch(std::vector<mtl::Dispatch>& ds, int l, int S, const int
                       mtl::Arg::B(W_, T(b + "indexer.k_norm.weight").offset),
                       mtl::Arg::B(cs_), mtl::Arg::B(qcur_, (size_t) t * 6144 * 4),
                       mtl::Arg::B(qidx_, (size_t) t * 512 * 4),
-                      mtl::Arg::B(rg.kq[(size_t) qi]), mtl::Arg::B(rg.vq[(size_t) qi]),
-                      mtl::Arg::B(rg.ksc[(size_t) qi]), mtl::Arg::B(rg.vsc[(size_t) qi]),
-                      mtl::Arg::B(rg.tail[(size_t) qi]), mtl::Arg::B(rg.dead[(size_t) qi]),
-                      mtl::Arg::B(rg.pooled[(size_t) qi]), mtl::Arg::V(a), mtl::Arg::B(mrope_)};
+                      mtl::Arg::B(rg.kq[(size_t) qi]), mtl::Arg::B(rg.vq[(size_t) qi])};
+            if (!kv_f16_) d.args.push_back(mtl::Arg::B(rg.ksc[(size_t) qi])),
+                          d.args.push_back(mtl::Arg::B(rg.vsc[(size_t) qi]));
+            d.args.push_back(mtl::Arg::B(rg.tail[(size_t) qi]));
+            d.args.push_back(mtl::Arg::B(rg.dead[(size_t) qi]));
+            d.args.push_back(mtl::Arg::B(rg.pooled[(size_t) qi]));
+            d.args.push_back(mtl::Arg::V(a));
+            d.args.push_back(mtl::Arg::B(mrope_));
             d.grid[0] = 33;
             d.grid[1] = 1;
             d.tg[0] = 256;
@@ -1810,11 +1824,15 @@ void Window::layer_batch(std::vector<mtl::Dispatch>& ds, int l, int S, const int
                 if (rec_) rec_->push_back({(int) ds.size() - 1, 100 + t});
             }
             mtl::Dispatch at;
-            at.p = P(lqsa_, "qsa_attn", {}, "qsa_attn");
+            at.p = P(lqsa_, kv_f16_ ? "qsa_attn_fp16" : "qsa_attn", {},
+                     kv_f16_ ? "qsa_attn_fp16" : "qsa_attn");
             at.args = {mtl::Arg::B(qcur_, (size_t) t * 6144 * 4), mtl::Arg::B(rg.kq[(size_t) qi]),
-                       mtl::Arg::B(rg.vq[(size_t) qi]), mtl::Arg::B(rg.ksc[(size_t) qi]),
-                       mtl::Arg::B(rg.vsc[(size_t) qi]), mtl::Arg::B(qids_, (size_t) t * 2051 * 4),
-                       mtl::Arg::B(part_, (size_t) t * 33 * 24 * 258 * 4), mtl::Arg::V(a)};
+                       mtl::Arg::B(rg.vq[(size_t) qi])};
+            if (!kv_f16_) at.args.push_back(mtl::Arg::B(rg.ksc[(size_t) qi])),
+                          at.args.push_back(mtl::Arg::B(rg.vsc[(size_t) qi]));
+            at.args.push_back(mtl::Arg::B(qids_, (size_t) t * 2051 * 4));
+            at.args.push_back(mtl::Arg::B(part_, (size_t) t * 33 * 24 * 258 * 4));
+            at.args.push_back(mtl::Arg::V(a));
             at.grid[0] = 33;
             at.grid[1] = 2;
             at.grid[2] = 1;
@@ -2008,6 +2026,13 @@ bool Window::run_batch(int S, const int* rows, const int32_t* tokens, const int6
     };
     auto traj_emit = [&](int S) {   // STRATA_BATCH_VERIFY: the per-row fold trajectory of the window that just ran
         const float* v = dsb_.as<float>();
+        if ((int) cap_tags_.size() == cap_ctr_ && cap_ctr_ > 0) {   // what each probe reads, index for index
+            static char cline[8192];
+            int w = std::snprintf(cline, sizeof cline, "caps:");
+            for (int i = 0; i < cap_ctr_ && w < 8000; ++i)
+                w += std::snprintf(cline + w, sizeof cline - w, " %d=%s", i, cap_tags_[(size_t) i].c_str());
+            std::fprintf(stderr, "%s\n", cline);
+        }
         static char tline[4096];
         for (int t = 0; t < S; ++t) {
             int w = std::snprintf(tline, sizeof tline, "traj b%d r%d:", S, t);
@@ -2051,6 +2076,7 @@ bool Window::run_batch(int S, const int* rows, const int32_t* tokens, const int6
     std::vector<mtl::Dispatch>& ds = cw.ds;
     cap_on_ = bprobe && S >= 2;   // every batch graph builds with its captures; each step prints its rows
     cap_ctr_ = 0;
+    cap_tags_.clear();
     nb_ = false;
     gemv_plain_ = true;   // every GEMV keeps the plain tile: the batch window's sums are the solo T=1 sums
     if (ple_on_) {
@@ -2074,7 +2100,7 @@ bool Window::run_batch(int S, const int* rows, const int32_t* tokens, const int6
         d1.grid[1] = S;
         d1.tg[0] = 256;
         push(ds, d1);
-        cap_fold(ds, S);
+        cap_fold(ds, S, "PLE-norm");
         struct PleArgs { uint32_t n_embd, hc; float eps; } pa{N, HC, strata::kernels::NG_RMS_EPS};
         auto off = [&](const char* n) { return T(n).offset; };
         mtl::Dispatch g1, g2, g3, g4;
@@ -2103,7 +2129,7 @@ bool Window::run_batch(int S, const int* rows, const int32_t* tokens, const int6
             nb_ = t > 0;   // the first waits on the gate norm; the rows never meet
             push(ds, c4);
         }
-        cap_fold(ds, S);   // after the conv's residual add, as the solo window's g4 capture
+        cap_fold(ds, S, "PLE-conv");   // after the conv's residual add, as the solo window's g4 capture
     }
     for (int l = 1; l < 48; ++l) layer_batch(ds, l, S, rows, pos);
     gr_read(ds, "output_hc", true, XA_, true, S);
