@@ -181,7 +181,9 @@ against 51.4 GB) because a half is two bytes where a code is one. So it buys exa
 the same as 8-bit on the token-forcing check (`tools/force_check.py`: 12.76% of forced tokens go to a different
 argmax, against 12.02% and 12.26% for two 8-bit arms — inside their own spread, and it raised no large-margin
 event). At a 4K prompt the two are level again (60.3 against 60.9 ms a decode window). Prefer 8-bit unless a
-conversation needs the cache's exact values and the memory has room.
+conversation needs the cache's exact values and the memory has room. A server started from a run settings file takes
+the flag in that file's `args` (`"--kv", "fp16"`), which reach the engine unchanged; a script that names no `--kv`
+runs the 8-bit default.
 
 **Reproducible greedy output (0.1.30, opt-in, `STRATA_IQ_MT_MIN=1`):** with the IQ models, the CPU computes an
 expert for one token with ggml's dot product and for several tokens with Strata's multi-token kernels, which round
