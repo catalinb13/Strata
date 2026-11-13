@@ -225,6 +225,14 @@ int gemv_nr_env() {
     static const int nr = [] { const char* e = std::getenv("STRATA_METAL_GEMV_NR"); return e ? std::atoi(e) : 1; }();
     return nr;
 }
+// the M1 Max tile re-sweep of 2026-11-13 (see gemv_tile).  STRATA_METAL_M1TILES=0: the pre-2026-11-13 picks.
+bool m1_tiles() {
+    static const bool on = [] {
+        const char* e = std::getenv("STRATA_METAL_M1TILES");
+        return !(e && std::string(e) == "0");
+    }();
+    return on;
+}
 // today's tile (M3 and newer, and shapes not tuned)
 GemvTile gemv_untuned(int ty, int n_in, int n_out, int ntok) {
     GemvTile g{16, 1, 4, 1};
@@ -257,7 +265,37 @@ GemvTile gemv_tile(int ty, int n_in, int n_out, int ntok, bool m12) {
     if (!m12 || env == "0" || gemv_nr_env() == 2) return g;
     const bool kq = ty == ref::Q4_K || ty == ref::Q5_K || ty == ref::Q6_K;
     const bool measured = kq || ty == ref::IQ4_XS || ty == ref::IQ3_S || ty == ref::Q8_0 || ty == ref::BF16;
-    if (!measured || n_out < 512 || g.L == 8) return g;
+    if (!measured || n_out < 512) return g;
+    // M1 Max tile re-sweep, 2026-11-13 (gap/tune/tiles.py: gemv_parity --one on each dense shape this pack decodes,
+    // at 2 tokens; every pick below is BITWISE identical to the tile it replaces - the bench prints NOT BITWISE
+    // for a tile whose answer differs, and the wide decoders are bitwise the plain ones):
+    //   attn_qkv    Q6_K 2560x10240  16,2,4,1 100.9 -> 4,1,4,1  99.6 us (216 GB/s)  x35 a window
+    //   attn_gate   Q6_K 2560x6144   16,2,4,1  63.0 -> 4,1,4,1  59.2 us  (+6.5%)     x35
+    //   attn_q      Q6_K 2560x12288  16,2,4,1 120.2 -> 4,1,4,1 112.1 us  (+7.3%)     x12
+    //   attn_output Q6_K 6144x2560   32,2,4,2  78.3 -> 16,2,4,1 67.6 us  (+16%)      x12
+    //   ssm_out Q8_0 6144x2560       32,2,4,2  80.6 -> 8,1,4,1  63.7 us  (+27%)      x36
+    //   lm head     Q6_K 2560x248320 16,2,4,1  2284 -> 8,2,4,1  2091 us  (+9%)       x1
+    //   shared dn Q8_0 640x2560       8,1,4,1  11.2 -> 4,1,4,1  10.9 us             x48
+    // A wider tile is no longer a win on this GPU: the wide decoder (16,2,4,1) measured 101.8 us against the plain
+    // decoder's 100.9 on attn_qkv, so the picks below run plain.  The 4-to-16-token verify windows keep the
+    // lookups further down: those were measured at 16 tokens and still win there.
+    // STRATA_METAL_M1TILES=0 returns to the pre-2026-11-13 picks.
+    if (ntok <= 3 && m1_tiles()) {
+        const bool q6 = ty == ref::Q6_K, q8 = ty == ref::Q8_0;
+        int L = 0, R = 2;
+        if (q6 && n_in == 2560 && n_out >= 32768) L = 8;                    // lm head (2560 x 248320)
+        else if (q6 && n_in == 2560 && n_out >= 2048) { L = 4; R = 1; }     // attn_qkv, attn_gate, attn_q
+        else if (q6 && n_in == 2560) L = 32;                               // attn_k/attn_v (512), shared gate/up (640)
+        else if (q6 && n_in == 6144) L = 16;                                // attn_output (6144 x 2560)
+        else if (q8 && n_in == 6144) { L = 8; R = 1; }                      // ssm_out (6144 x 2560)
+        else if (q8 && n_in == 640) { L = 4; R = 1; }                       // shared-expert down (640 x 2560)
+        if (L) {
+            GemvTile m = g;
+            m.L = L, m.R = R, m.S = 4, m.K = 1, m.x = false, m.wide = false, m.tuned = true;
+            return m;
+        }
+    }
+    if (g.L == 8) return g;
     if (ntok > 3) {
         // wide windows (T 4..16, the --lookup-max-t verify path): measured here with gemv_parity --one --ntok 16 on
         // an M1 Max.  At many tokens the window gemv is x-traffic bound, so fewer lanes per row and more rows per
