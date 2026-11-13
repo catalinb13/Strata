@@ -192,6 +192,20 @@ group("prefill",
       ("pipe1b", A(tokens=f"{ROOT}/gap/tokens/t16384.txt", max_new=32, args=["--prefill-pipe", "1"])),
       )
 
+group("livemtp",
+      ("LIVE_nomtp", A(drop=["--mtp"])),
+      ("MTP_on", A()),
+      ("LIVE_nomtp2", A(drop=["--mtp"])),
+      ("MTP_on2", A()),
+      )
+
+group("livemtp_sampled",
+      ("nomtp_samp", A(drop=["--mtp"], args=["--seed", "1", "--temperature", "0.8", "--top-p", "0.95"])),
+      ("mtp_samp", A(args=["--seed", "1", "--temperature", "0.8", "--top-p", "0.95"])),
+      ("nomtp_samp2", A(drop=["--mtp"], args=["--seed", "1", "--temperature", "0.8", "--top-p", "0.95"])),
+      ("mtp_samp2", A(args=["--seed", "1", "--temperature", "0.8", "--top-p", "0.95"])),
+      )
+
 # ---------------------------------------------------------------- memory shape
 group("mem",
       ("BASE", A()),
